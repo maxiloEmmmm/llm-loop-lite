@@ -1,0 +1,24 @@
+/target/
+
+# Local runtime state
+.llm-loop/
+.codex/
+
+# Editor and OS noise
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Local env/config files
+.env
+.env.*
+*.local
+
+# Logs
+*.log
+logs/
+
+# Release artifacts
+dist/
+release-assets/
