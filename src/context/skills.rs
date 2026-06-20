@@ -51,8 +51,8 @@ pub async fn load_skills_instructions(
         lines.push(line);
     }
     lines.push("### How to use skills".to_string());
-    lines.push("- Discovery: The list above is the skills available in this session (name + description + file path).".to_string());
-    lines.push("- Scope: skills directly under `~/.llm-loop/skills/<skill>/SKILL.md` are global. User-scoped skills live under `~/.llm-loop/skills/__user/<channel>__<user_id>/<skill>/SKILL.md`; only the current channel/user scope is loaded.".to_string());
+    lines.push("- Discovery: The list above is the skills available in this session (name + description + file path). Skill bodies live on disk at the listed paths.".to_string());
+    lines.push("- Missing/blocked: If a named skill is not in the list or the path cannot be read, say so briefly and continue with the best fallback.".to_string());
     lines.push("- Trigger rules: If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.".to_string());
     lines.push("- How to use a skill: after deciding to use a skill, open and read its `SKILL.md` completely before taking task actions. Resolve relative paths against the directory containing that `SKILL.md`.".to_string());
     lines.push("- If `scripts/`, `references/`, `assets/`, or templates exist, prefer using those files instead of recreating their contents.".to_string());

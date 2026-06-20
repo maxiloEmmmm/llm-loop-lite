@@ -93,5 +93,7 @@ async fn skills_instructions_render_available_skill_metadata() {
     assert!(text.contains("## Skills"));
     assert!(text.contains("global_skill: 全局技能"));
     assert!(text.contains("local_skill: 本地技能"));
+    assert!(text.contains("Skill bodies live on disk at the listed paths"));
+    assert!(!text.contains("~/.llm-loop/skills/<skill>/SKILL.md"));
     assert!(text.contains("open and read its `SKILL.md` completely"));
 }
