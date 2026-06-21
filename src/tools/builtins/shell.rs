@@ -10,6 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
 
 use crate::error::{AppError, AppResult};
+use crate::resource::ResourceUsage;
 use crate::tools::registry::{
     ToolCall, ToolContext, ToolHandler, ToolInput, ToolOutputKind, ToolResult,
 };
@@ -36,6 +37,33 @@ pub struct RunningProcess {
     stderr: Vec<u8>,
     /// 启动时间。
     started: Instant,
+}
+
+impl ExecSessions {
+    /// 返回长命令表资源估算，适用于 resources 子命令解释常驻进程缓冲。
+    pub fn resource_usage(&self) -> ResourceUsage {
+        let buffer_bytes = self
+            .processes
+            .values()
+            .map(|process| {
+                process
+                    .stdout
+                    .capacity()
+                    .saturating_add(process.stderr.capacity())
+            })
+            .sum::<usize>();
+        let entry_bytes = self
+            .processes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(u64, RunningProcess)>());
+        ResourceUsage::new(
+            "tools.exec_sessions",
+            "hashmap",
+            self.processes.len(),
+            Some(self.processes.capacity()),
+            entry_bytes.saturating_add(buffer_bytes),
+        )
+    }
 }
 
 /// exec_command 参数。

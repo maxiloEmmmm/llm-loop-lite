@@ -10,6 +10,7 @@ use crate::error::{AppError, AppResult};
 use crate::ids::new_reply_hash;
 use crate::message::{MessageUpdate, OutboundFormat, OutboundMessage, outbound_target_from_source};
 use crate::plan_store;
+use crate::resource::ResourceUsage;
 use crate::tools::registry::{
     ToolCall, ToolContext, ToolHandler, ToolInput, ToolOutputKind, ToolResult,
 };
@@ -496,6 +497,29 @@ impl PlanStates {
         self
     }
 
+    /// 返回计划状态表资源估算，适用于 resources 子命令解释计划缓存。
+    pub fn resource_usage(&self) -> ResourceUsage {
+        let body_bytes = self
+            .items
+            .iter()
+            .map(|(key, state)| {
+                key.capacity()
+                    .saturating_add(estimate_plan_state_bytes(state))
+            })
+            .sum::<usize>();
+        let entry_bytes = self
+            .items
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(String, PlanState)>());
+        ResourceUsage::new(
+            "tools.plan_states",
+            "hashmap",
+            self.items.len(),
+            Some(self.items.capacity()),
+            entry_bytes.saturating_add(body_bytes),
+        )
+    }
+
     /// 保存指定 session 的计划状态，适用于工具创建计划。
     pub async fn save_state(&mut self, session_key: &str, state: PlanState) -> AppResult<()> {
         self.items.insert(session_key.to_string(), state);
@@ -898,6 +922,34 @@ where
     };
     let child = item.children.iter_mut().find(|child| child.key == part)?;
     find_child_item_mut(child, parts)
+}
+
+/// 估算单个计划状态的字符串和列表容量。
+fn estimate_plan_state_bytes(state: &PlanState) -> usize {
+    state.channel_name.capacity()
+        + state.chat_id.capacity()
+        + state.message_id.capacity()
+        + state.reply_hash.as_ref().map(String::capacity).unwrap_or(0)
+        + estimate_plan_items_bytes(&state.items)
+}
+
+/// 递归估算计划项容量，适用于 resources 即时统计。
+fn estimate_plan_items_bytes(items: &Vec<PlanListItem>) -> usize {
+    let list_bytes = items
+        .capacity()
+        .saturating_mul(std::mem::size_of::<PlanListItem>());
+    list_bytes.saturating_add(
+        items
+            .iter()
+            .map(|item| {
+                item.title.capacity()
+                    + item.key.capacity()
+                    + item.cost.as_ref().map(String::capacity).unwrap_or(0)
+                    + item.desc.as_ref().map(String::capacity).unwrap_or(0)
+                    + estimate_plan_items_bytes(&item.children)
+            })
+            .sum::<usize>(),
+    )
 }
 
 #[cfg(test)]

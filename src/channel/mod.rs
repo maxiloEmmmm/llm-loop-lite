@@ -1,6 +1,7 @@
 use tokio::sync::mpsc;
 
 mod builtin;
+mod capability;
 mod feishu;
 mod qq;
 mod telegram;
@@ -9,6 +10,7 @@ mod telegram;
 mod qq_test;
 
 pub use builtin::{BuiltinChannel, BuiltinChannelHandle, build_channels};
+pub use capability::ChannelCapabilities;
 
 use crate::error::AppResult;
 use crate::home::AppPaths;
@@ -66,6 +68,11 @@ pub trait Channel: Send {
     /// 返回确认能力，适用于 daemon 选择统一确认链路。
     fn ack_capability(&self, _kind: ChannelAckKind) -> ChannelAckCapability {
         ChannelAckCapability::None
+    }
+
+    /// 返回 channel 能力集合，适用于上层按能力选择接口。
+    fn capabilities(&self) -> ChannelCapabilities {
+        ChannelCapabilities::none()
     }
 
     /// 执行确认反馈，具体平台自行选择 reaction、文本或临时状态。

@@ -11,6 +11,7 @@ use crate::home::AppPaths;
 use crate::message::{
     MessageSource, MessageUpdate, OutboundMessage, SendResult, UserInputRequest, UserInputResponse,
 };
+use crate::resource::ResourceUsage;
 use crate::session::SessionState;
 use crate::tools::builtins;
 use crate::tools::spec::ToolSpec;
@@ -242,6 +243,24 @@ impl ToolRegistry {
             .await
             .remove_state(session_key)
             .await
+    }
+
+    /// 返回工具层资源估算，适用于 resources 子命令即时查询。
+    pub async fn resource_usage(&self) -> Vec<ResourceUsage> {
+        let mut usages = Vec::new();
+        usages.push(ResourceUsage::new(
+            "tools.handlers",
+            "hashmap",
+            self.handlers.len(),
+            Some(self.handlers.capacity()),
+            self.handlers
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(String, Arc<dyn ToolHandler>)>())
+                .saturating_add(self.handlers.keys().map(String::capacity).sum::<usize>()),
+        ));
+        usages.push(self.shared.exec_sessions.lock().await.resource_usage());
+        usages.push(self.shared.plans.lock().await.resource_usage());
+        usages
     }
 }
 

@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::channel::{Channel, ChannelAckCapability, ChannelAckKind};
+use crate::channel::{Channel, ChannelAckCapability, ChannelAckKind, ChannelCapabilities};
 use crate::config::{ChannelConfig, QqChannelConfig};
 use crate::error::{AppError, AppResult};
 use crate::home::AppPaths;
@@ -20,6 +20,7 @@ use crate::message::{
     InboundMessage, MessageSource, MessageUpdate, OutboundMessage, OutboundRecipient, SendResult,
     UserInputRequest, UserInputResponse,
 };
+use crate::resource::{ResourceUsage, estimate_answers_bytes, estimate_user_input_request_bytes};
 
 const OP_DISPATCH: i64 = 0;
 const OP_HEARTBEAT: i64 = 1;
@@ -59,6 +60,8 @@ pub struct QqChannelHandle {
     name: String,
     /// QQ REST API。
     api: Arc<QqApi>,
+    /// 消息去重状态。
+    seen: Arc<Mutex<QqDedupCache>>,
     /// 等待中的用户输入请求。
     user_inputs: Arc<Mutex<QqPendingUserInputs>>,
     /// 已发送消息目标缓存。
@@ -95,6 +98,7 @@ impl QqChannel {
         QqChannelHandle {
             name: self.name.clone(),
             api: Arc::clone(&self.api),
+            seen: Arc::clone(&self.seen),
             user_inputs: Arc::clone(&self.user_inputs),
             sent_messages: Arc::clone(&self.sent_messages),
         }
@@ -120,6 +124,36 @@ impl QqChannelHandle {
     /// 返回 QQ 确认能力，适用于轻量句柄分派。
     pub fn ack_capability(&self, _kind: ChannelAckKind) -> ChannelAckCapability {
         ChannelAckCapability::TextReply
+    }
+
+    /// 返回 QQ 能力集合，适用于轻量句柄暴露运行态能力。
+    pub fn capabilities(&self) -> ChannelCapabilities {
+        ChannelCapabilities {
+            patch_message: false,
+            append_update: true,
+            request_user_input: true,
+            reaction_ack: false,
+            text_ack: true,
+            chat_action: false,
+            reply_threading: true,
+            inbound_attachments: false,
+            outbound_attachments: false,
+        }
+    }
+
+    /// 返回 QQ 句柄持有的缓存资源估算。
+    pub async fn resource_usage(&self) -> Vec<ResourceUsage> {
+        vec![
+            self.seen.lock().await.resource_usage("channel.qq.dedup"),
+            self.user_inputs
+                .lock()
+                .await
+                .resource_usage("channel.qq.pending_inputs"),
+            self.sent_messages
+                .lock()
+                .await
+                .resource_usage("channel.qq.sent_messages"),
+        ]
     }
 
     /// 按统一语义执行 QQ 确认反馈。
@@ -407,6 +441,21 @@ impl Channel for QqChannel {
     /// 返回 QQ 确认能力，适用于 daemon 统一确认语义。
     fn ack_capability(&self, _kind: ChannelAckKind) -> ChannelAckCapability {
         ChannelAckCapability::TextReply
+    }
+
+    /// 返回 QQ 能力集合，适用于上层按平台能力选择接口。
+    fn capabilities(&self) -> ChannelCapabilities {
+        ChannelCapabilities {
+            patch_message: false,
+            append_update: true,
+            request_user_input: true,
+            reaction_ack: false,
+            text_ack: true,
+            chat_action: false,
+            reply_threading: true,
+            inbound_attachments: false,
+            outbound_attachments: false,
+        }
     }
 
     /// 按统一语义执行 QQ 确认反馈。
@@ -1277,6 +1326,27 @@ impl QqDedupCache {
         }
         false
     }
+
+    /// 返回 QQ 去重缓存资源估算。
+    fn resource_usage(&self, name: &str) -> ResourceUsage {
+        let order_bytes = self
+            .order
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_add(self.order.iter().map(String::capacity).sum::<usize>());
+        let id_bytes = self
+            .ids
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_add(self.ids.iter().map(String::capacity).sum::<usize>());
+        ResourceUsage::new(
+            name,
+            "cache",
+            self.ids.len(),
+            Some(self.capacity),
+            order_bytes.saturating_add(id_bytes),
+        )
+    }
 }
 
 /// QQ 已发送消息目标缓存。
@@ -1354,6 +1424,36 @@ impl QqSentMessageTargets {
     fn clear(&mut self) {
         self.order.clear();
         self.targets.clear();
+    }
+
+    /// 返回已发送消息目标缓存资源估算。
+    fn resource_usage(&self, name: &str) -> ResourceUsage {
+        let order_bytes = self
+            .order
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_add(self.order.iter().map(String::capacity).sum::<usize>());
+        let target_bytes = self
+            .targets
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(String, QqSentMessageTarget)>())
+            .saturating_add(
+                self.targets
+                    .iter()
+                    .map(|(key, target)| {
+                        key.capacity()
+                            + target.chat_id.capacity()
+                            + target.reply_to.as_ref().map(String::capacity).unwrap_or(0)
+                    })
+                    .sum::<usize>(),
+            );
+        ResourceUsage::new(
+            name,
+            "cache",
+            self.targets.len(),
+            Some(self.capacity),
+            order_bytes.saturating_add(target_bytes),
+        )
     }
 }
 
@@ -1440,6 +1540,33 @@ impl QqPendingUserInputs {
     /// 清空所有等待项，适用于 channel 停止释放内存。
     fn clear(&mut self) {
         self.items.clear();
+    }
+
+    /// 返回等待输入集合资源估算。
+    fn resource_usage(&self, name: &str) -> ResourceUsage {
+        let body_bytes = self
+            .items
+            .iter()
+            .map(|(key, pending)| key.capacity().saturating_add(pending.resource_bytes()))
+            .sum::<usize>();
+        let entry_bytes = self
+            .items
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(String, QqPendingUserInput)>());
+        ResourceUsage::new(
+            name,
+            "hashmap",
+            self.items.len(),
+            Some(self.items.capacity()),
+            entry_bytes.saturating_add(body_bytes),
+        )
+    }
+}
+
+impl QqPendingUserInput {
+    /// 估算单个等待输入项容量。
+    fn resource_bytes(&self) -> usize {
+        estimate_user_input_request_bytes(&self.request) + estimate_answers_bytes(&self.answers)
     }
 }
 

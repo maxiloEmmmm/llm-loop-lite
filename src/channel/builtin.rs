@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 use crate::channel::feishu::{FeishuChannel, FeishuChannelHandle};
 use crate::channel::qq::{QqChannel, QqChannelHandle};
 use crate::channel::telegram::{TelegramChannel, TelegramChannelHandle};
-use crate::channel::{Channel, ChannelAckCapability, ChannelAckKind};
+use crate::channel::{Channel, ChannelAckCapability, ChannelAckKind, ChannelCapabilities};
 use crate::config::ChannelConfig;
 use crate::error::{AppError, AppResult};
 use crate::home::AppPaths;
@@ -11,6 +11,7 @@ use crate::message::{
     InboundMessage, MessageSource, MessageUpdate, OutboundMessage, SendResult, UserInputRequest,
     UserInputResponse,
 };
+use crate::resource::ResourceUsage;
 use crate::tools::registry::ToolChannel;
 
 /// 内置 channel 枚举，负责把配置里的 kind 分派到具体实现。
@@ -89,6 +90,15 @@ impl Channel for BuiltinChannel {
         }
     }
 
+    /// 分派能力集合查询到具体内置 channel。
+    fn capabilities(&self) -> ChannelCapabilities {
+        match self {
+            Self::Feishu(channel) => channel.capabilities(),
+            Self::Qq(channel) => channel.capabilities(),
+            Self::Telegram(channel) => channel.capabilities(),
+        }
+    }
+
     /// 分派确认反馈到具体内置 channel。
     async fn acknowledge(&self, message: &InboundMessage, kind: ChannelAckKind) -> AppResult<()> {
         match self {
@@ -137,6 +147,24 @@ impl BuiltinChannelHandle {
             Self::Feishu(channel) => channel.ack_capability(kind),
             Self::Qq(channel) => channel.ack_capability(kind),
             Self::Telegram(channel) => channel.ack_capability(kind),
+        }
+    }
+
+    /// 返回内置 channel 能力集合。
+    pub fn capabilities(&self) -> ChannelCapabilities {
+        match self {
+            Self::Feishu(channel) => channel.capabilities(),
+            Self::Qq(channel) => channel.capabilities(),
+            Self::Telegram(channel) => channel.capabilities(),
+        }
+    }
+
+    /// 返回内置 channel 句柄缓存资源估算。
+    pub async fn resource_usage(&self) -> Vec<ResourceUsage> {
+        match self {
+            Self::Feishu(channel) => channel.resource_usage().await,
+            Self::Qq(channel) => channel.resource_usage().await,
+            Self::Telegram(channel) => channel.resource_usage().await,
         }
     }
 

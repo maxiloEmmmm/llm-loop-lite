@@ -32,6 +32,8 @@ use crate::store::{remove_session_store, spawn_store_cleaner};
 use crate::tools::ToolRegistry;
 use crate::tools::registry::ToolChannel;
 
+pub mod resources;
+
 /// daemon 主体，负责连接 channel、维护 session、调用 provider。
 pub struct Daemon {
     /// 应用配置。
@@ -169,6 +171,7 @@ impl Daemon {
                 .map(BuiltinChannel::tool_handle)
                 .collect::<Vec<_>>(),
         );
+        resources::spawn_resource_socket(Arc::clone(&self), Arc::clone(&handles));
         spawn_cron_scheduler(
             self.paths.crons_dir.clone(),
             handles.as_ref().as_slice(),

@@ -35,6 +35,8 @@ pub struct AppPaths {
     pub auth_path: PathBuf,
     /// Codex 风格 installation id 存储文件路径。
     pub installation_id_path: PathBuf,
+    /// daemon 本地 Unix socket 路径，供 CLI 子命令查询运行态。
+    pub daemon_socket_path: PathBuf,
 }
 
 impl AppPaths {
@@ -56,6 +58,7 @@ impl AppPaths {
         let codex_config_path = codex_home.join("config.toml");
         let auth_path = app_dir.join("auth.json");
         let installation_id_path = app_dir.join("installation_id");
+        let daemon_socket_path = app_dir.join("llm-loop.sock");
         let channel_data_dir = app_dir.join("channel");
         let channel_store_dir = channel_data_dir.join("store");
         let skills_dir = app_dir.join("skills");
@@ -79,6 +82,7 @@ impl AppPaths {
             codex_config_path,
             auth_path,
             installation_id_path,
+            daemon_socket_path,
         }
     }
 

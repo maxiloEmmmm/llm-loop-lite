@@ -16,6 +16,22 @@ fn parse_login_command() {
     assert_eq!(command, CliCommand::Login);
 }
 
+/// doctor 子命令解析为本地体检。
+#[test]
+fn parse_doctor_command() {
+    let command = CliCommand::parse(vec!["doctor".to_string()]).expect("应能解析 doctor");
+
+    assert_eq!(command, CliCommand::Doctor);
+}
+
+/// resources 子命令解析为运行态资源查询。
+#[test]
+fn parse_resources_command() {
+    let command = CliCommand::parse(vec!["resources".to_string()]).expect("应能解析 resources");
+
+    assert_eq!(command, CliCommand::Resources);
+}
+
 /// 未知子命令返回 CLI 错误。
 #[test]
 fn parse_unknown_command_as_error() {

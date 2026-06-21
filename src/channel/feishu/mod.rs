@@ -18,13 +18,17 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::channel::{Channel, ChannelAckCapability, ChannelAckKind};
+use crate::channel::{Channel, ChannelAckCapability, ChannelAckKind, ChannelCapabilities};
 use crate::config::{ChannelConfig, FeishuChannelConfig};
 use crate::error::{AppError, AppResult};
 use crate::home::AppPaths;
 use crate::message::{
     InboundAttachment, InboundMessage, MessageSource, MessageUpdate, OutboundMessage,
     OutboundRecipient, SendResult, UserInputRequest, UserInputResponse,
+};
+use crate::resource::{
+    ResourceUsage, estimate_answers_bytes, estimate_message_source_bytes,
+    estimate_user_input_request_bytes,
 };
 use crate::session::build_message_key;
 use crate::store::store_hash;
@@ -234,6 +238,39 @@ impl FeishuChannelHandle {
             ChannelAckKind::StopDone => ChannelAckCapability::TextReply,
             ChannelAckKind::Received | ChannelAckKind::ResetDone => ChannelAckCapability::Reaction,
         }
+    }
+
+    /// 返回飞书能力集合，适用于轻量句柄暴露运行态能力。
+    pub fn capabilities(&self) -> ChannelCapabilities {
+        ChannelCapabilities {
+            patch_message: true,
+            append_update: false,
+            request_user_input: true,
+            reaction_ack: true,
+            text_ack: true,
+            chat_action: false,
+            reply_threading: true,
+            inbound_attachments: true,
+            outbound_attachments: false,
+        }
+    }
+
+    /// 返回飞书句柄持有的缓存资源估算。
+    pub async fn resource_usage(&self) -> Vec<ResourceUsage> {
+        vec![
+            self.seen
+                .lock()
+                .await
+                .resource_usage("channel.feishu.dedup"),
+            self.thread_replies
+                .lock()
+                .await
+                .resource_usage("channel.feishu.thread_replies"),
+            self.user_inputs
+                .lock()
+                .await
+                .resource_usage("channel.feishu.pending_inputs"),
+        ]
     }
 
     /// 按统一语义执行飞书确认反馈。
@@ -949,6 +986,21 @@ impl Channel for FeishuChannel {
         }
     }
 
+    /// 返回飞书能力集合，适用于上层按平台能力选择接口。
+    fn capabilities(&self) -> ChannelCapabilities {
+        ChannelCapabilities {
+            patch_message: true,
+            append_update: false,
+            request_user_input: true,
+            reaction_ack: true,
+            text_ack: true,
+            chat_action: false,
+            reply_threading: true,
+            inbound_attachments: true,
+            outbound_attachments: false,
+        }
+    }
+
     /// 按统一语义执行飞书确认反馈。
     async fn acknowledge(&self, message: &InboundMessage, kind: ChannelAckKind) -> AppResult<()> {
         match kind {
@@ -1265,6 +1317,43 @@ impl PendingUserInputs {
     fn clear(&mut self) {
         self.items.clear();
     }
+
+    /// 返回等待输入集合资源估算。
+    fn resource_usage(&self, name: &str) -> ResourceUsage {
+        let body_bytes = self
+            .items
+            .iter()
+            .map(|(key, pending)| key.capacity().saturating_add(pending.resource_bytes()))
+            .sum::<usize>();
+        let entry_bytes = self
+            .items
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(String, PendingUserInput)>());
+        ResourceUsage::new(
+            name,
+            "hashmap",
+            self.items.len(),
+            Some(self.items.capacity()),
+            entry_bytes.saturating_add(body_bytes),
+        )
+    }
+}
+
+impl PendingUserInput {
+    /// 估算单个等待输入项容量。
+    fn resource_bytes(&self) -> usize {
+        self.source
+            .as_ref()
+            .map(estimate_message_source_bytes)
+            .unwrap_or(0)
+            + estimate_user_input_request_bytes(&self.request)
+            + estimate_answers_bytes(&self.answers)
+            + self
+                .card_message_id
+                .as_ref()
+                .map(String::capacity)
+                .unwrap_or(0)
+    }
 }
 
 /// 构造首个飞书选择卡片，适用于 request_user_input 工具。
@@ -1544,6 +1633,27 @@ impl ThreadReplyCache {
         self.order.clear();
         self.ids.clear();
     }
+
+    /// 返回子话题回复缓存资源估算。
+    fn resource_usage(&self, name: &str) -> ResourceUsage {
+        let order_bytes = self
+            .order
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_add(self.order.iter().map(String::capacity).sum::<usize>());
+        let ids_bytes = self
+            .ids
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_add(self.ids.iter().map(String::capacity).sum::<usize>());
+        ResourceUsage::new(
+            name,
+            "cache",
+            self.order.len(),
+            Some(self.capacity),
+            order_bytes.saturating_add(ids_bytes),
+        )
+    }
 }
 
 impl DedupCache {
@@ -1570,6 +1680,16 @@ impl DedupCache {
     /// 清空去重窗口，适用于 reset 后释放内存占用。
     fn clear(&mut self) {
         self.order.clear();
+    }
+
+    /// 返回去重缓存资源估算。
+    fn resource_usage(&self, name: &str) -> ResourceUsage {
+        let bytes = self
+            .order
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_add(self.order.iter().map(String::capacity).sum::<usize>());
+        ResourceUsage::new(name, "cache", self.order.len(), Some(self.capacity), bytes)
     }
 }
 

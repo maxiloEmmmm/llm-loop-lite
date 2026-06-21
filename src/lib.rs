@@ -13,6 +13,7 @@ pub mod logger;
 pub mod message;
 pub mod plan_store;
 pub mod provider;
+pub mod resource;
 pub mod scheduler;
 pub mod session;
 pub mod session_store;

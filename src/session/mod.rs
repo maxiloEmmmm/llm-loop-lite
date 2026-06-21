@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::context::InitialContext;
 use crate::ids::new_session_id;
 use crate::message::MessageSource;
+use crate::resource::ResourceUsage;
 
 /// 单个 session 的内存状态，只保存轻量元信息。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +54,36 @@ impl SessionRegistry {
     /// 安装已恢复的 session，适用于本地历史懒加载。
     pub fn insert_restored(&mut self, session: SessionState) {
         self.sessions.insert(session.key.clone(), session);
+    }
+
+    /// 返回当前内存中 session 数量，适用于资源统计。
+    pub fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// 返回 session 注册表资源估算，适用于 resources 子命令解释内存来源。
+    pub fn resource_usage(&self) -> ResourceUsage {
+        let string_bytes = self
+            .sessions
+            .iter()
+            .map(|(key, session)| {
+                key.capacity()
+                    + session.key.capacity()
+                    + session.id.capacity()
+                    + session.instructions.capacity()
+            })
+            .sum::<usize>();
+        let entry_bytes = self
+            .sessions
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(String, SessionState)>());
+        ResourceUsage::new(
+            "sessions.registry",
+            "hashmap",
+            self.sessions.len(),
+            Some(self.sessions.capacity()),
+            entry_bytes.saturating_add(string_bytes),
+        )
     }
 
     /// 重置指定来源的 session，并让原 key 绑定新的 session id。

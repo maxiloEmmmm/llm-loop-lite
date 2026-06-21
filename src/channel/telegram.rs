@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::channel::{Channel, ChannelAckCapability, ChannelAckKind};
+use crate::channel::{Channel, ChannelAckCapability, ChannelAckKind, ChannelCapabilities};
 use crate::config::{ChannelConfig, TelegramChannelConfig};
 use crate::error::{AppError, AppResult};
 use crate::home::AppPaths;
@@ -18,6 +18,7 @@ use crate::message::{
     InboundAttachment, InboundMessage, MessageSource, MessageUpdate, OutboundMessage, SendResult,
     UserInputRequest, UserInputResponse,
 };
+use crate::resource::{ResourceUsage, estimate_answers_bytes, estimate_user_input_request_bytes};
 
 /// TG 收到消息后的确认 reaction，使用普通 emoji 避免自定义表情权限限制。
 const TELEGRAM_RECEIVED_REACTION_EMOJI: &str = "\u{1F440}";
@@ -51,12 +52,16 @@ pub struct TelegramChannelHandle {
     name: String,
     /// Telegram REST API。
     api: Arc<TelegramApi>,
+    /// 消息去重状态。
+    seen: Arc<Mutex<TelegramDedupCache>>,
     /// 等待中的用户输入请求。
     user_inputs: Arc<Mutex<TelegramPendingUserInputs>>,
     /// 已发送消息目标缓存。
     sent_messages: Arc<Mutex<TelegramSentMessages>>,
     /// 是否启用收到消息确认。
     received_ack_enabled: bool,
+    /// 是否下载入站附件。
+    download_attachments: bool,
 }
 
 /// Telegram polling 配置。
@@ -362,9 +367,11 @@ impl TelegramChannel {
         TelegramChannelHandle {
             name: self.name.clone(),
             api: Arc::clone(&self.api),
+            seen: Arc::clone(&self.seen),
             user_inputs: Arc::clone(&self.user_inputs),
             sent_messages: Arc::clone(&self.sent_messages),
             received_ack_enabled: self.behavior.send_typing,
+            download_attachments: self.behavior.download_attachments,
         }
     }
 
@@ -398,6 +405,39 @@ impl TelegramChannelHandle {
             ChannelAckKind::ResetDone => ChannelAckCapability::Reaction,
             ChannelAckKind::StopDone => ChannelAckCapability::TextReply,
         }
+    }
+
+    /// 返回 Telegram 能力集合，适用于轻量句柄暴露运行态能力。
+    pub fn capabilities(&self) -> ChannelCapabilities {
+        ChannelCapabilities {
+            patch_message: true,
+            append_update: false,
+            request_user_input: true,
+            reaction_ack: self.received_ack_enabled,
+            text_ack: true,
+            chat_action: self.received_ack_enabled,
+            reply_threading: true,
+            inbound_attachments: self.download_attachments,
+            outbound_attachments: false,
+        }
+    }
+
+    /// 返回 Telegram 句柄持有的缓存资源估算。
+    pub async fn resource_usage(&self) -> Vec<ResourceUsage> {
+        vec![
+            self.seen
+                .lock()
+                .await
+                .resource_usage("channel.telegram.dedup"),
+            self.user_inputs
+                .lock()
+                .await
+                .resource_usage("channel.telegram.pending_inputs"),
+            self.sent_messages
+                .lock()
+                .await
+                .resource_usage("channel.telegram.sent_messages"),
+        ]
     }
 
     /// 按统一语义执行 Telegram 确认反馈。
@@ -671,6 +711,21 @@ impl Channel for TelegramChannel {
             ChannelAckKind::Received => ChannelAckCapability::None,
             ChannelAckKind::ResetDone => ChannelAckCapability::Reaction,
             ChannelAckKind::StopDone => ChannelAckCapability::TextReply,
+        }
+    }
+
+    /// 返回 Telegram 能力集合，适用于上层按平台能力选择接口。
+    fn capabilities(&self) -> ChannelCapabilities {
+        ChannelCapabilities {
+            patch_message: true,
+            append_update: false,
+            request_user_input: true,
+            reaction_ack: self.behavior.send_typing,
+            text_ack: true,
+            chat_action: self.behavior.send_typing,
+            reply_threading: true,
+            inbound_attachments: self.behavior.download_attachments,
+            outbound_attachments: false,
         }
     }
 
@@ -965,6 +1020,27 @@ impl TelegramDedupCache {
         }
         true
     }
+
+    /// 返回 Telegram 去重缓存资源估算。
+    fn resource_usage(&self, name: &str) -> ResourceUsage {
+        let order_bytes = self
+            .order
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_add(self.order.iter().map(String::capacity).sum::<usize>());
+        let seen_bytes = self
+            .seen
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_add(self.seen.iter().map(String::capacity).sum::<usize>());
+        ResourceUsage::new(
+            name,
+            "cache",
+            self.seen.len(),
+            Some(self.capacity),
+            order_bytes.saturating_add(seen_bytes),
+        )
+    }
 }
 
 impl TelegramSentMessages {
@@ -1000,6 +1076,39 @@ impl TelegramSentMessages {
         self.order.clear();
         self.items.clear();
     }
+
+    /// 返回已发送消息缓存资源估算。
+    fn resource_usage(&self, name: &str) -> ResourceUsage {
+        let order_bytes = self
+            .order
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_add(self.order.iter().map(String::capacity).sum::<usize>());
+        let item_bytes = self
+            .items
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(String, TelegramSentMessageTarget)>())
+            .saturating_add(
+                self.items
+                    .iter()
+                    .map(|(key, target)| {
+                        key.capacity()
+                            + target.chat_id.capacity()
+                            + target
+                                .message_thread_id
+                                .map(|_| std::mem::size_of::<i64>())
+                                .unwrap_or(0)
+                    })
+                    .sum::<usize>(),
+            );
+        ResourceUsage::new(
+            name,
+            "cache",
+            self.items.len(),
+            Some(self.capacity),
+            order_bytes.saturating_add(item_bytes),
+        )
+    }
 }
 
 impl TelegramPendingUserInputs {
@@ -1028,6 +1137,26 @@ impl TelegramPendingUserInputs {
     /// 清空等待中的用户输入请求。
     fn clear(&mut self) {
         self.requests.clear();
+    }
+
+    /// 返回等待输入集合资源估算。
+    fn resource_usage(&self, name: &str) -> ResourceUsage {
+        let body_bytes = self
+            .requests
+            .iter()
+            .map(|(key, pending)| key.capacity().saturating_add(pending.resource_bytes()))
+            .sum::<usize>();
+        let entry_bytes = self
+            .requests
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(String, TelegramPendingUserInput)>());
+        ResourceUsage::new(
+            name,
+            "hashmap",
+            self.requests.len(),
+            Some(self.requests.capacity()),
+            entry_bytes.saturating_add(body_bytes),
+        )
     }
 
     /// 处理 callback 选择。
@@ -1084,6 +1213,13 @@ impl TelegramPendingUserInputs {
             });
         }
         Ok(UserInputResponse { answers })
+    }
+}
+
+impl TelegramPendingUserInput {
+    /// 估算单个等待输入项容量。
+    fn resource_bytes(&self) -> usize {
+        estimate_user_input_request_bytes(&self.request) + estimate_answers_bytes(&self.answers)
     }
 }
 
