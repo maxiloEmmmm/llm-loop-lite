@@ -3,6 +3,7 @@
 # Local runtime state
 .llm-loop/
 .codex/
+AGENTS.override.md
 
 # Editor and OS noise
 .DS_Store

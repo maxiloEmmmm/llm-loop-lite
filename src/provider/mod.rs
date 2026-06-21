@@ -1,8 +1,12 @@
 pub mod claude;
 pub mod codex;
+pub mod limits;
 
 pub use claude::ClaudeProvider;
 pub use codex::CodexProvider;
+
+#[cfg(test)]
+mod limits_test;
 
 use crate::config::AppConfig;
 use crate::error::AppResult;

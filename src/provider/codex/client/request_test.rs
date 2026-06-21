@@ -71,6 +71,7 @@ fn request_body_puts_initial_context_in_instructions() {
     assert_eq!(body["store"], false);
     assert_eq!(body["include"][0], "reasoning.encrypted_content");
     assert_eq!(body["prompt_cache_key"], session.id);
+    assert_eq!(body["max_output_tokens"], 128_000);
 }
 
 /// Codex headers 对齐官方 Responses HTTP 路径。
@@ -196,6 +197,7 @@ fn compact_request_body_omits_tools() {
 
     assert!(body.get("tools").is_none());
     assert_eq!(body["store"], false);
+    assert_eq!(body["max_output_tokens"], 128_000);
     assert_eq!(input[0]["role"], "user");
     assert_eq!(input[1]["role"], "assistant");
     assert_eq!(input[2]["role"], "user");

@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use crate::config::{AppConfig, ProviderConfig};
 use crate::error::{AppError, AppResult};
 use crate::message::InboundAttachment;
+use crate::provider::limits::resolve_model_limits;
 use crate::session::SessionState;
 use crate::session_store::ConversationItem;
 use crate::tools::registry::{ToolCall, ToolInput};
@@ -72,9 +73,7 @@ pub fn build_request_body(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| AppError::Provider("provider.model is required".to_string()))?;
-    let max_tokens = config.max_tokens.ok_or_else(|| {
-        AppError::Provider("provider.max-tokens is required for claude".to_string())
-    })?;
+    let max_tokens = resolve_model_limits(config).max_tokens;
     let mut body = json!({
         "model": model,
         "max_tokens": max_tokens,
@@ -91,6 +90,8 @@ pub fn build_request_body(
     if !session.instructions.trim().is_empty() {
         body["system"] = Value::String(session.instructions.clone());
     }
+    apply_prompt_cache(&mut body);
+    apply_thinking_options(&mut body, model, max_tokens, config)?;
     Ok(body)
 }
 
@@ -105,9 +106,7 @@ pub fn build_compact_request_body(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| AppError::Provider("provider.model is required".to_string()))?;
-    let max_tokens = config.max_tokens.ok_or_else(|| {
-        AppError::Provider("provider.max-tokens is required for claude".to_string())
-    })?;
+    let max_tokens = resolve_model_limits(config).max_tokens;
     let mut body = json!({
         "model": model,
         "max_tokens": max_tokens,
@@ -119,7 +118,195 @@ pub fn build_compact_request_body(
     if !session.instructions.trim().is_empty() {
         body["system"] = Value::String(session.instructions.clone());
     }
+    apply_prompt_cache(&mut body);
+    apply_thinking_options(&mut body, model, max_tokens, config)?;
     Ok(body)
+}
+
+/// 写入 Claude 自动 prompt cache，适用于多轮会话复用稳定前缀。
+fn apply_prompt_cache(body: &mut Value) {
+    let mut remaining = 4;
+    mark_system_cache(body, &mut remaining);
+    mark_last_tool_cache(body, &mut remaining);
+    mark_latest_user_message_cache(body, &mut remaining);
+}
+
+/// 标记顶层 system block，适用于 Anthropic 只接受 block 级 cache_control 的场景。
+fn mark_system_cache(body: &mut Value, remaining: &mut usize) {
+    let Some(system) = body.get_mut("system") else {
+        return;
+    };
+    match system {
+        Value::String(text) => {
+            if !take_cache_breakpoint(remaining) {
+                return;
+            }
+            *system = json!([{
+                "type": "text",
+                "text": text.clone(),
+                "cache_control": cache_control_value(),
+            }]);
+        }
+        Value::Array(parts) => {
+            let Some(part) = parts.iter_mut().rev().find(|part| {
+                part.get("type").and_then(Value::as_str) == Some("text")
+            }) else {
+                return;
+            };
+            mark_block_cache(part, remaining);
+        }
+        _ => {}
+    }
+}
+
+/// 标记最后一个 tool，适用于工具定义稳定且优先进入 Claude cache 的场景。
+fn mark_last_tool_cache(body: &mut Value, remaining: &mut usize) {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let Some(tool) = tools.last_mut() else {
+        return;
+    };
+    mark_block_cache(tool, remaining);
+}
+
+/// 标记最近一条 user 消息，适用于工具循环中复用本轮用户前缀。
+fn mark_latest_user_message_cache(body: &mut Value, remaining: &mut usize) {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let Some(message) = messages.iter_mut().rev().find(|message| {
+        message.get("role").and_then(Value::as_str) == Some("user")
+    }) else {
+        return;
+    };
+    let Some(content) = message.get_mut("content") else {
+        return;
+    };
+    mark_message_content_cache(content, remaining);
+}
+
+/// 标记消息内容末尾 block，适用于 string 与 content block 两种 Claude 输入形态。
+fn mark_message_content_cache(content: &mut Value, remaining: &mut usize) {
+    match content {
+        Value::String(text) => {
+            if !take_cache_breakpoint(remaining) {
+                return;
+            }
+            *content = json!([{
+                "type": "text",
+                "text": text.clone(),
+                "cache_control": cache_control_value(),
+            }]);
+        }
+        Value::Array(blocks) => {
+            let Some(block) = blocks.iter_mut().rev().find(|block| block.is_object()) else {
+                return;
+            };
+            mark_block_cache(block, remaining);
+        }
+        _ => {}
+    }
+}
+
+/// 写入单个 block cache_control，适用于统一控制 Anthropic 最多 4 个断点。
+fn mark_block_cache(block: &mut Value, remaining: &mut usize) {
+    if block.get("cache_control").is_some() || !take_cache_breakpoint(remaining) {
+        return;
+    }
+    if let Some(object) = block.as_object_mut() {
+        object.insert("cache_control".to_string(), cache_control_value());
+    }
+}
+
+/// 消耗一个 Claude cache 断点，适用于避免超过 Anthropic 4 断点限制。
+fn take_cache_breakpoint(remaining: &mut usize) -> bool {
+    if *remaining == 0 {
+        return false;
+    }
+    *remaining -= 1;
+    true
+}
+
+/// 构造 Claude cache_control，适用于所有 block 级 prompt cache 标记。
+fn cache_control_value() -> Value {
+    json!({
+        "type": "ephemeral",
+    })
+}
+
+/// 写入 Claude thinking 参数，适用于复用 Codex reasoning effort 配置。
+fn apply_thinking_options(
+    body: &mut Value,
+    model: &str,
+    max_tokens: u32,
+    config: &ProviderConfig,
+) -> AppResult<()> {
+    let Some(effort) = claude_effort_for_request(config) else {
+        return Ok(());
+    };
+    if supports_adaptive_thinking(model) {
+        body["thinking"] = json!({
+            "type": "adaptive",
+            "display": "summarized",
+        });
+        body["output_config"] = json!({
+            "effort": effort,
+        });
+        return Ok(());
+    }
+
+    let Some(budget_tokens) = thinking_budget_tokens(&effort, max_tokens) else {
+        crate::log_info!(
+            "claude thinking disabled because max_tokens is too small model={} max_tokens={}",
+            model,
+            max_tokens
+        );
+        return Ok(());
+    };
+    body["thinking"] = json!({
+        "type": "enabled",
+        "budget_tokens": budget_tokens,
+        "display": "summarized",
+    });
+    Ok(())
+}
+
+/// 提取 Claude effort，适用于 `model_reasoning_effort` 与 Codex 行为对齐。
+fn claude_effort_for_request(config: &ProviderConfig) -> Option<String> {
+    let value = config.model_reasoning_effort.as_deref()?.trim();
+    match value {
+        "" | "off" | "none" | "disabled" => None,
+        "minimal" => Some("low".to_string()),
+        other => Some(other.to_string()),
+    }
+}
+
+/// 判断模型是否使用 adaptive thinking，避免给旧模型发送会 400 的参数。
+fn supports_adaptive_thinking(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("claude-fable-5")
+        || model.contains("claude-mythos-5")
+        || model.contains("claude-opus-4-8")
+        || model.contains("claude-opus-4-7")
+        || model.contains("claude-opus-4-6")
+        || model.contains("claude-sonnet-4-6")
+}
+
+/// 映射旧版 thinking budget，适用于尚不支持 adaptive thinking 的模型。
+fn thinking_budget_tokens(effort: &str, max_tokens: u32) -> Option<u32> {
+    let requested = match effort {
+        "low" => 2048,
+        "medium" => 8192,
+        "high" => 16384,
+        "xhigh" | "max" => 31999,
+        _ => 16384,
+    };
+    let max_budget = max_tokens.checked_sub(1024)?;
+    if max_budget < 1024 {
+        return None;
+    }
+    Some(requested.min(max_budget).max(1024))
 }
 
 /// 发送 Claude 请求并解析 JSON 响应。

@@ -70,6 +70,9 @@ pub struct ProviderConfig {
     /// Claude 单次生成最大 token，Messages API 要求显式传入。
     #[serde(rename = "max-tokens")]
     pub max_tokens: Option<u32>,
+    /// 模型最大上下文 token，缺失时按 provider+model registry 推断。
+    #[serde(rename = "max-context-tokens")]
+    pub max_context_tokens: Option<u64>,
     /// Codex Responses reasoning.effort；缺失时不发送 reasoning。
     pub model_reasoning_effort: Option<String>,
     /// Codex Responses service_tier；`fast` 兼容 Codex 配置写法。
@@ -101,6 +104,9 @@ pub struct ModelProviderConfig {
     /// Claude 单次生成最大 token。
     #[serde(rename = "max-tokens")]
     pub max_tokens: Option<u32>,
+    /// 当前 profile 的模型最大上下文 token。
+    #[serde(rename = "max-context-tokens")]
+    pub max_context_tokens: Option<u64>,
     /// 可选 profile 级思考等级；缺失时继承顶层配置。
     pub model_reasoning_effort: Option<String>,
     /// 可选 profile 级服务层级；缺失时继承顶层配置。
@@ -247,6 +253,7 @@ impl Default for ProviderConfig {
             api_key: None,
             api_key_env: None,
             max_tokens: None,
+            max_context_tokens: None,
             model_reasoning_effort: None,
             service_tier: None,
         }
@@ -266,6 +273,7 @@ impl Default for ModelProviderConfig {
             api_key: None,
             api_key_env: None,
             max_tokens: None,
+            max_context_tokens: None,
             model_reasoning_effort: None,
             service_tier: None,
             requires_openai_auth: false,
@@ -443,6 +451,9 @@ fn apply_model_provider_profile(
         .clone()
         .or_else(|| config.provider.api_key_env.clone());
     config.provider.max_tokens = profile.max_tokens.or(config.provider.max_tokens);
+    config.provider.max_context_tokens = profile
+        .max_context_tokens
+        .or(config.provider.max_context_tokens);
     config.provider.custom_provider = if kind == "codex" {
         profile
             .custom_provider

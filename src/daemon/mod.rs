@@ -23,6 +23,7 @@ use crate::message::{
     InboundMessage, MessageSource, MessageUpdate, OutboundFormat, OutboundMessage, SendResult,
     UserInputRequest, UserInputResponse, outbound_target_from_source,
 };
+use crate::provider::limits::resolve_model_limits;
 use crate::provider::{BuiltinProvider, Provider, build_provider};
 use crate::scheduler::{SchedulerChannel, run_cron_scheduler};
 use crate::session::{SessionRegistry, build_message_key};
@@ -276,6 +277,7 @@ impl Daemon {
             return Ok(());
         }
 
+        let model_limits = resolve_model_limits(&self.config.provider);
         let session = if is_cron_task {
             let context = load_cron_context().await?;
             crate::log_info!(
@@ -287,6 +289,7 @@ impl Daemon {
                 "{session_key}:cron:{}",
                 new_session_id()
             ));
+            session.max_context_tokens = Some(model_limits.context_window);
             session.instructions = context.instructions;
             session.initial_context_loaded = true;
             session
@@ -305,6 +308,7 @@ impl Daemon {
                 sessions.set_initial_context(&message.source, context);
             }
             let mut sessions = self.sessions.lock().await;
+            sessions.set_max_context_tokens(&message.source, model_limits.context_window);
             sessions.get_or_create(&message.source).clone()
         };
         if active_turn.token.is_cancelled() {

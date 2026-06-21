@@ -19,6 +19,9 @@ use crate::tools::spec::ToolSpec;
 
 use client::{ClaudeRoute, build_compact_request_body, build_request_body, send_claude_request};
 
+#[cfg(test)]
+mod client_test;
+
 /// Claude provider 实例，适用于 Anthropic Messages API 兼容后端。
 #[derive(Debug, Clone)]
 pub struct ClaudeProvider {

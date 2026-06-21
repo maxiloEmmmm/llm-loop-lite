@@ -10,6 +10,7 @@ use crate::provider::codex::telemetry::{
     CodexRequestMetadata, X_CODEX_INSTALLATION_ID_HEADER, X_CODEX_TURN_METADATA_HEADER,
     X_CODEX_WINDOW_ID_HEADER,
 };
+use crate::provider::limits::resolve_model_limits;
 use crate::session::SessionState;
 use crate::session_store::ConversationItem;
 use crate::tools::spec::{ToolSpec, create_tools_json_for_responses_api};
@@ -71,6 +72,7 @@ pub fn build_request_body(
         "instructions": &session.instructions,
         "input": input,
         "stream": true,
+        "max_output_tokens": resolve_model_limits(config).max_tokens,
         "tools": tools,
         "tool_choice": "auto",
         "parallel_tool_calls": false,
@@ -132,6 +134,7 @@ pub fn build_compact_request_body(
         "instructions": &session.instructions,
         "input": input,
         "stream": true,
+        "max_output_tokens": resolve_model_limits(config).max_tokens,
         "store": false,
         "include": include,
         "prompt_cache_key": &session.id,

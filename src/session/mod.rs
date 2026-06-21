@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::context::InitialContext;
 use crate::ids::new_session_id;
 use crate::message::MessageSource;
+use crate::provider::limits::DEFAULT_CONTEXT_WINDOW;
 use crate::resource::ResourceUsage;
 
 /// 单个 session 的内存状态，只保存轻量元信息。
@@ -116,6 +117,12 @@ impl SessionRegistry {
         session.instructions = context.instructions;
         session.initial_context_loaded = true;
     }
+
+    /// 写入模型上下文窗口，适用于 provider/model registry 每轮刷新。
+    pub fn set_max_context_tokens(&mut self, source: &MessageSource, max_context_tokens: u64) {
+        let session = self.get_or_create(source);
+        session.max_context_tokens = Some(max_context_tokens);
+    }
 }
 
 impl SessionState {
@@ -126,7 +133,7 @@ impl SessionState {
             id: new_session_id(),
             instructions: String::new(),
             initial_context_loaded: false,
-            max_context_tokens: Some(400_000),
+            max_context_tokens: Some(DEFAULT_CONTEXT_WINDOW),
             used_tokens: 0,
         }
     }
