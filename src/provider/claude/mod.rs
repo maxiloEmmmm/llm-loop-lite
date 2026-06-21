@@ -10,6 +10,7 @@ use crate::config::AppConfig;
 use crate::error::{AppError, AppResult};
 use crate::home::AppPaths;
 use crate::message::{InboundAttachment, MessageSource};
+use crate::provider::limits::{ModelLimits, resolve_model_limits};
 use crate::provider::{AssistantReply, CompactionReply, Provider};
 use crate::session::SessionState;
 use crate::session_store::ConversationItem;
@@ -45,6 +46,11 @@ impl ClaudeProvider {
 }
 
 impl Provider for ClaudeProvider {
+    /// 返回 Claude 当前模型限制，适用于隐藏 Anthropic/Kimi host 细节。
+    fn model_limits(&self) -> ModelLimits {
+        resolve_model_limits(&self.config.provider)
+    }
+
     /// 生成 Claude 回复，按 Messages API 的 tool_use/tool_result 循环请求。
     async fn complete(
         &self,

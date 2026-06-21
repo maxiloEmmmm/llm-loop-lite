@@ -208,7 +208,7 @@ impl Daemon {
 }
 
 /// 返回当前进程内存信息，适用于 Linux 部署环境。
-fn current_process_memory() -> (Option<u64>, Option<u64>) {
+pub(crate) fn current_process_memory() -> (Option<u64>, Option<u64>) {
     let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
         return (None, None);
     };

@@ -23,7 +23,6 @@ use crate::message::{
     InboundMessage, MessageSource, MessageUpdate, OutboundFormat, OutboundMessage, SendResult,
     UserInputRequest, UserInputResponse, outbound_target_from_source,
 };
-use crate::provider::limits::resolve_model_limits;
 use crate::provider::{BuiltinProvider, Provider, build_provider};
 use crate::scheduler::{SchedulerChannel, run_cron_scheduler};
 use crate::session::{SessionRegistry, build_message_key};
@@ -226,6 +225,10 @@ impl Daemon {
                 .await?;
             return Ok(());
         }
+        if message.is_status_command() {
+            self.handle_status_command(&message, &channels).await?;
+            return Ok(());
+        }
         let session_lock = self.session_lock(&session_key).await;
         let _guard = session_lock.lock().await;
         crate::log_info!(
@@ -235,8 +238,10 @@ impl Daemon {
         );
         if message.is_reset_command() {
             self.cancel_active_turn(&session_key);
+            let model_limits = self.provider.model_limits();
             let mut sessions = self.sessions.lock().await;
             let session = sessions.reset(&message.source);
+            session.max_context_tokens = Some(model_limits.context_window);
             let new_session_id = session.id.clone();
             crate::log_info!(
                 "daemon session reset session_key={} new_session_id={}",
@@ -277,7 +282,7 @@ impl Daemon {
             return Ok(());
         }
 
-        let model_limits = resolve_model_limits(&self.config.provider);
+        let model_limits = self.provider.model_limits();
         let session = if is_cron_task {
             let context = load_cron_context().await?;
             crate::log_info!(
@@ -570,6 +575,70 @@ impl Daemon {
         Ok(())
     }
 
+    /// 处理 status 命令，适用于不经过 provider 直接返回本地运行态。
+    async fn handle_status_command(
+        &self,
+        message: &InboundMessage,
+        channels: &[BuiltinChannelHandle],
+    ) -> AppResult<()> {
+        crate::log_info!(
+            "daemon status requested message_id={}",
+            message.message_id.as_deref().unwrap_or("")
+        );
+        self.restore_session_if_needed(message).await?;
+        let model_limits = self.provider.model_limits();
+        let (used_tokens, active_sessions) = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions.get(&message.source);
+            (
+                session
+                    .map(|session| session.used_tokens)
+                    .unwrap_or_default(),
+                sessions.len(),
+            )
+        };
+        let counts = collect_service_status_counts(&self.paths, &message.source);
+        let process = collect_process_status();
+        let text = render_status_reply(
+            used_tokens,
+            model_limits.context_window,
+            active_sessions,
+            &counts,
+            &process,
+        );
+        Self::send_direct_reply(channels, message, text).await?;
+        Ok(())
+    }
+
+    /// 发送命令直回消息，适用于 `/status` 这类不进入模型的命令。
+    async fn send_direct_reply(
+        channels: &[BuiltinChannelHandle],
+        message: &InboundMessage,
+        text: String,
+    ) -> AppResult<()> {
+        let channel = channels
+            .iter()
+            .find(|channel| channel.name() == message.source.channel_name)
+            .ok_or_else(|| {
+                AppError::Channel(format!(
+                    "channel `{}` not found for direct reply",
+                    message.source.channel_name
+                ))
+            })?;
+        let (recipient, chat_id) = outbound_target_from_source(&message.source);
+        channel
+            .send(OutboundMessage {
+                channel_name: message.source.channel_name.clone(),
+                chat_id,
+                recipient,
+                text,
+                reply_to: message.message_id.clone(),
+                format: OutboundFormat::Text,
+            })
+            .await?;
+        Ok(())
+    }
+
     /// 取消当前活跃请求，适用于 stop/reset 需要打断 provider future。
     fn cancel_active_turn(&self, session_key: &str) -> Option<ActiveTurn> {
         let active = self
@@ -824,6 +893,261 @@ impl Daemon {
             .await
             .map(Some)
             .map_err(|_| AppError::Cron("cron semaphore closed".to_string()))
+    }
+}
+
+/// `/status` 服务计数快照，适用于命令直回。
+#[derive(Debug, Clone, Copy)]
+struct ServiceStatusCounts {
+    /// 全局记忆文件数量。
+    global_memories: usize,
+    /// 当前用户记忆文件数量。
+    user_memories: usize,
+    /// 当前用户 skill 数量。
+    user_skills: usize,
+    /// 当前服务 cron 任务数量。
+    cron_tasks: usize,
+}
+
+/// 当前进程占用快照，适用于 `/status` 展示资源占用。
+#[derive(Debug, Clone, Copy)]
+struct ProcessStatus {
+    /// RSS 内存字节数。
+    rss_bytes: Option<u64>,
+    /// 进程累计 CPU 秒数。
+    cpu_seconds: Option<f64>,
+    /// 进程启动以来的平均 CPU 占用百分比。
+    cpu_percent_since_start: Option<f64>,
+}
+
+/// 汇总服务本地计数，适用于 `/status` 不进入模型直接读取状态。
+fn collect_service_status_counts(paths: &AppPaths, source: &MessageSource) -> ServiceStatusCounts {
+    ServiceStatusCounts {
+        global_memories: count_memory_files(&paths.mems_dir),
+        user_memories: status_memory_user_key(source)
+            .map(|key| count_memory_files(&paths.mems_dir.join("__user").join(key)))
+            .unwrap_or_default(),
+        user_skills: status_user_skill_scope(source)
+            .map(|scope| count_user_skills(&paths.skills_dir.join("__user").join(scope)))
+            .unwrap_or_default(),
+        cron_tasks: count_cron_tasks(&paths.crons_dir),
+    }
+}
+
+/// 统计合法记忆文件数量，适用于复用记忆注入的文件命名规则。
+fn count_memory_files(root: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+                && is_status_memory_file(&entry.path())
+        })
+        .count()
+}
+
+/// 判断是否为合法记忆文件，适用于过滤非 `[A-Za-z0-9]+.md` 文件。
+fn is_status_memory_file(path: &std::path::Path) -> bool {
+    if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+        return false;
+    }
+    let Some(key) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    !key.is_empty() && key.chars().all(|ch| ch.is_ascii_alphanumeric())
+}
+
+/// 生成当前用户记忆目录 key，适用于 `/status` 统计个人记忆。
+fn status_memory_user_key(source: &MessageSource) -> Option<String> {
+    let user_id = source.user_id.as_deref()?.trim();
+    if user_id.is_empty() {
+        return None;
+    }
+    let key = normalize_status_scope_part(user_id);
+    (!key.is_empty()).then_some(key)
+}
+
+/// 生成当前用户 skill scope，适用于 `/status` 统计个人 skill。
+fn status_user_skill_scope(source: &MessageSource) -> Option<String> {
+    let channel = if source.channel_name.trim().is_empty() {
+        source.platform.trim()
+    } else {
+        source.channel_name.trim()
+    };
+    let user_id = source.user_id.as_deref()?.trim();
+    if channel.is_empty() || user_id.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}__{}",
+        normalize_status_scope_part(channel),
+        normalize_status_scope_part(user_id)
+    ))
+}
+
+/// 清理状态目录片段，适用于复用记忆和 skill 的隔离规则。
+fn normalize_status_scope_part(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// 统计用户 skill 数量，适用于计算含 SKILL.md 的一级 skill 目录。
+fn count_user_skills(root: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+                && entry.path().join("SKILL.md").is_file()
+        })
+        .count()
+}
+
+/// 统计当前服务 cron 任务数量，适用于汇总所有 channel scope。
+fn count_cron_tasks(root: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut total = 0_usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            total = total.saturating_add(count_cron_tasks(&path));
+        } else if path.file_name().and_then(|name| name.to_str()) == Some("cron.md") {
+            total = total.saturating_add(count_cron_file_tasks(&path));
+        }
+    }
+    total
+}
+
+/// 统计单个 cron.md 的有效任务行，适用于排除空行和注释。
+fn count_cron_file_tasks(path: &std::path::Path) -> usize {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    raw.lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('#') && line.split_whitespace().count() >= 6
+        })
+        .count()
+}
+
+/// 汇总当前进程占用，适用于 `/status` 展示内存和 CPU。
+fn collect_process_status() -> ProcessStatus {
+    let (rss_bytes, _) = resources::current_process_memory();
+    let (cpu_seconds, cpu_percent_since_start) = current_process_cpu_usage();
+    ProcessStatus {
+        rss_bytes,
+        cpu_seconds,
+        cpu_percent_since_start,
+    }
+}
+
+/// 读取 Linux procfs CPU 数据，适用于部署环境计算平均 CPU 占用。
+fn current_process_cpu_usage() -> (Option<f64>, Option<f64>) {
+    let Ok(raw_stat) = std::fs::read_to_string("/proc/self/stat") else {
+        return (None, None);
+    };
+    let Some((cpu_ticks, start_ticks)) = parse_proc_self_stat(&raw_stat) else {
+        return (None, None);
+    };
+    let ticks_per_second = linux_ticks_per_second();
+    let cpu_seconds = cpu_ticks as f64 / ticks_per_second;
+    let cpu_percent = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|raw| raw.split_whitespace().next()?.parse::<f64>().ok())
+        .and_then(|uptime_seconds| {
+            let start_seconds = start_ticks as f64 / ticks_per_second;
+            let elapsed = uptime_seconds - start_seconds;
+            (elapsed > 0.0).then_some((cpu_seconds / elapsed) * 100.0)
+        });
+    (Some(cpu_seconds), cpu_percent)
+}
+
+/// 解析 `/proc/self/stat`，适用于提取 utime/stime/starttime。
+fn parse_proc_self_stat(raw: &str) -> Option<(u64, u64)> {
+    let after_name = raw.get(raw.rfind(')')?.saturating_add(2)..)?;
+    let fields = after_name.split_whitespace().collect::<Vec<_>>();
+    // 触发条件：comm 字段可能包含空格，必须先跳过最后一个右括号。
+    // 不能直接按空格切整行：进程名会让 procfs 字段下标错位。
+    // 防止回归：CPU 统计不会因为进程名变化解析出错误字段。
+    let user_ticks = fields.get(11)?.parse::<u64>().ok()?;
+    let system_ticks = fields.get(12)?.parse::<u64>().ok()?;
+    let start_ticks = fields.get(19)?.parse::<u64>().ok()?;
+    Some((user_ticks.saturating_add(system_ticks), start_ticks))
+}
+
+/// 返回 Linux clock ticks，适用于 procfs jiffies 换算秒数。
+fn linux_ticks_per_second() -> f64 {
+    100.0
+}
+
+/// 渲染 `/status` 回复正文。
+fn render_status_reply(
+    used_tokens: u64,
+    max_context_tokens: u64,
+    active_conversations: usize,
+    counts: &ServiceStatusCounts,
+    process: &ProcessStatus,
+) -> String {
+    format!(
+        "状态\n上下文: {} / {} tokens\n活跃会话: {}\n记忆: 全局 {}, 个人 {}\n技能: 个人 {}\n定时任务: {}\n服务: rss {}, cpu {}",
+        used_tokens,
+        max_context_tokens,
+        active_conversations,
+        counts.global_memories,
+        counts.user_memories,
+        counts.user_skills,
+        counts.cron_tasks,
+        format_optional_bytes(process.rss_bytes),
+        format_process_cpu(process)
+    )
+}
+
+/// 格式化可选字节数，适用于平台不支持时显示 unavailable。
+fn format_optional_bytes(value: Option<u64>) -> String {
+    value
+        .map(format_bytes)
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
+/// 格式化字节数，适用于 status 短文本展示。
+fn format_bytes(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes / GIB)
+    } else {
+        format!("{:.2} MiB", bytes / MIB)
+    }
+}
+
+/// 格式化 CPU 占用，适用于同时展示平均百分比和累计 CPU 秒数。
+fn format_process_cpu(process: &ProcessStatus) -> String {
+    match (process.cpu_percent_since_start, process.cpu_seconds) {
+        (Some(percent), Some(seconds)) => format!("{percent:.2}% ({seconds:.2}s)"),
+        (None, Some(seconds)) => format!("{seconds:.2}s"),
+        _ => "unavailable".to_string(),
     }
 }
 

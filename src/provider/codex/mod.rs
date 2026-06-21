@@ -10,6 +10,7 @@ use crate::config::AppConfig;
 use crate::error::AppResult;
 use crate::home::AppPaths;
 use crate::message::{InboundAttachment, MessageSource};
+use crate::provider::limits::{ModelLimits, resolve_model_limits};
 use crate::provider::{AssistantReply, CompactionReply, Provider};
 use crate::session::SessionState;
 use crate::session_store::ConversationItem;
@@ -53,6 +54,11 @@ impl CodexProvider {
 }
 
 impl Provider for CodexProvider {
+    /// 返回 Codex 当前模型限制，适用于隐藏 registry/custom provider 细节。
+    fn model_limits(&self) -> ModelLimits {
+        resolve_model_limits(&self.config.provider)
+    }
+
     /// 生成 Codex 回复，按 Codex Responses SSE 请求方式发送。
     async fn complete(
         &self,

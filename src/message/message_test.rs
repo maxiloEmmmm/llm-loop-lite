@@ -44,3 +44,21 @@ fn stop_command_ignores_leading_mention_placeholder() {
 fn stop_command_rejects_extra_text() {
     assert!(!text_message("@_user_1 /stop now").is_stop_command());
 }
+
+/// 验证私聊 status 命令仍然按直回快路径识别。
+#[test]
+fn status_command_matches_plain_text() {
+    assert!(text_message("/status").is_status_command());
+}
+
+/// 验证群聊 @ 机器人后 status 仍走直回快路径。
+#[test]
+fn status_command_ignores_leading_mention_placeholder() {
+    assert!(text_message("@_user_1 /status").is_status_command());
+}
+
+/// 验证带额外正文的 status 不会被误识别成命令。
+#[test]
+fn status_command_rejects_extra_text() {
+    assert!(!text_message("@_user_1 /status now").is_status_command());
+}

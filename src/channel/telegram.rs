@@ -22,6 +22,8 @@ use crate::resource::{ResourceUsage, estimate_answers_bytes, estimate_user_input
 
 /// TG 收到消息后的确认 reaction，使用普通 emoji 避免自定义表情权限限制。
 const TELEGRAM_RECEIVED_REACTION_EMOJI: &str = "\u{1F440}";
+/// TG 命令完成后的确认 reaction，适用于 stop/reset 这类短确认。
+const TELEGRAM_DONE_REACTION_EMOJI: &str = "\u{2705}";
 
 /// Telegram Bot API channel，负责 polling 收消息和 REST 发消息。
 pub struct TelegramChannel {
@@ -403,7 +405,7 @@ impl TelegramChannelHandle {
             ChannelAckKind::Received if self.received_ack_enabled => ChannelAckCapability::Reaction,
             ChannelAckKind::Received => ChannelAckCapability::None,
             ChannelAckKind::ResetDone => ChannelAckCapability::Reaction,
-            ChannelAckKind::StopDone => ChannelAckCapability::TextReply,
+            ChannelAckKind::StopDone => ChannelAckCapability::Reaction,
         }
     }
 
@@ -413,7 +415,7 @@ impl TelegramChannelHandle {
             patch_message: true,
             append_update: false,
             request_user_input: true,
-            reaction_ack: self.received_ack_enabled,
+            reaction_ack: true,
             text_ack: true,
             chat_action: self.received_ack_enabled,
             reply_threading: true,
@@ -571,7 +573,7 @@ impl TelegramChannelHandle {
                 .set_message_reaction(
                     &message.source.chat_id,
                     message_id,
-                    TELEGRAM_RECEIVED_REACTION_EMOJI,
+                    TELEGRAM_DONE_REACTION_EMOJI,
                     true,
                 )
                 .await
@@ -625,17 +627,18 @@ impl TelegramChannelHandle {
         Ok(())
     }
 
-    /// stop 完成后回复 done，适用于用户确认当前请求已停止。
+    /// stop 完成后添加 reaction，适用于 TG 支持消息附属表情的场景。
     pub async fn acknowledge_stop(&self, message: &InboundMessage) -> AppResult<()> {
-        self.api
-            .send_message(
-                &message.source.chat_id,
-                "done",
-                message.message_id.as_deref(),
-                message.source.thread_id.as_deref().and_then(parse_i64),
-                None,
-            )
-            .await?;
+        if let Some(message_id) = message.message_id.as_deref().and_then(parse_i64) {
+            self.api
+                .set_message_reaction(
+                    &message.source.chat_id,
+                    message_id,
+                    TELEGRAM_DONE_REACTION_EMOJI,
+                    true,
+                )
+                .await?;
+        }
         Ok(())
     }
 }
@@ -710,7 +713,7 @@ impl Channel for TelegramChannel {
             ChannelAckKind::Received if self.behavior.send_typing => ChannelAckCapability::Reaction,
             ChannelAckKind::Received => ChannelAckCapability::None,
             ChannelAckKind::ResetDone => ChannelAckCapability::Reaction,
-            ChannelAckKind::StopDone => ChannelAckCapability::TextReply,
+            ChannelAckKind::StopDone => ChannelAckCapability::Reaction,
         }
     }
 
@@ -720,7 +723,7 @@ impl Channel for TelegramChannel {
             patch_message: true,
             append_update: false,
             request_user_input: true,
-            reaction_ack: self.behavior.send_typing,
+            reaction_ack: true,
             text_ack: true,
             chat_action: self.behavior.send_typing,
             reply_threading: true,

@@ -83,3 +83,39 @@ fn claude_dated_alias_uses_family_limits() {
         }
     );
 }
+
+/// Claude 兼容 Kimi host 使用 Kimi 窗口限制。
+#[test]
+fn claude_kimi_host_uses_kimi_limits() {
+    let mut config = provider_config("claude", "kimi-k2.7-code");
+    config.base_url = Some("https://api.kimi.com/coding/".to_string());
+
+    let limits = resolve_model_limits(&config);
+
+    assert_eq!(
+        limits,
+        ModelLimits {
+            context_window: 262_144,
+            max_tokens: 32_768,
+        }
+    );
+}
+
+/// 显式限制仍优先于 Claude Kimi host 默认值。
+#[test]
+fn explicit_config_overrides_claude_kimi_host_limits() {
+    let mut config = provider_config("claude", "kimi-k2.7-code");
+    config.base_url = Some("https://api.kimi.com/coding/".to_string());
+    config.max_context_tokens = Some(131_072);
+    config.max_tokens = Some(8_192);
+
+    let limits = resolve_model_limits(&config);
+
+    assert_eq!(
+        limits,
+        ModelLimits {
+            context_window: 131_072,
+            max_tokens: 8_192,
+        }
+    );
+}

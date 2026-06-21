@@ -11,6 +11,8 @@ const GPT5_CONTEXT_WINDOW: u64 = 400_000;
 const GPT5_LARGE_CONTEXT_WINDOW: u64 = 1_050_000;
 const CLAUDE_DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
 const CLAUDE_LONG_CONTEXT_WINDOW: u64 = 1_000_000;
+const CLAUDE_KIMI_CONTEXT_WINDOW: u64 = 262_144;
+const CLAUDE_KIMI_MAX_TOKENS: u32 = 32_768;
 
 /// 模型窗口限制，适用于 provider 请求和 session 上下文预算。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +44,9 @@ impl Default for ModelLimits {
 pub fn resolve_model_limits(config: &ProviderConfig) -> ModelLimits {
     let mut limits = lookup_provider_model_limits(&config.kind, config.model.as_deref())
         .unwrap_or_else(ModelLimits::default);
+    if is_claude_kimi_host(config) {
+        limits = ModelLimits::new(CLAUDE_KIMI_CONTEXT_WINDOW, CLAUDE_KIMI_MAX_TOKENS);
+    }
     if let Some(context_window) = config.max_context_tokens.filter(|value| *value > 0) {
         limits.context_window = context_window;
     }
@@ -49,6 +54,18 @@ pub fn resolve_model_limits(config: &ProviderConfig) -> ModelLimits {
         limits.max_tokens = max_tokens;
     }
     limits
+}
+
+/// 判断 Claude host 是否为 Kimi 兼容端点，适用于覆盖 Anthropic 默认窗口。
+fn is_claude_kimi_host(config: &ProviderConfig) -> bool {
+    if config.kind.trim().to_ascii_lowercase() != "claude" {
+        return false;
+    }
+    config
+        .base_url
+        .as_deref()
+        .map(|base_url| base_url.to_ascii_lowercase().contains("api.kimi.com"))
+        .unwrap_or(false)
 }
 
 /// 按 provider+model 查找限制，适用于内置已知模型。

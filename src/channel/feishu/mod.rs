@@ -164,6 +164,7 @@ impl FeishuChannel {
             let user_input_result = if message.attachments.is_empty()
                 && !message.is_reset_command()
                 && !message.is_stop_command()
+                && !message.is_status_command()
             {
                 user_inputs
                     .lock()
@@ -235,8 +236,9 @@ impl FeishuChannelHandle {
     /// 返回飞书确认能力，适用于轻量句柄分派。
     pub fn ack_capability(&self, kind: ChannelAckKind) -> ChannelAckCapability {
         match kind {
-            ChannelAckKind::StopDone => ChannelAckCapability::TextReply,
-            ChannelAckKind::Received | ChannelAckKind::ResetDone => ChannelAckCapability::Reaction,
+            ChannelAckKind::Received | ChannelAckKind::ResetDone | ChannelAckKind::StopDone => {
+                ChannelAckCapability::Reaction
+            }
         }
     }
 
@@ -247,7 +249,7 @@ impl FeishuChannelHandle {
             append_update: false,
             request_user_input: true,
             reaction_ack: true,
-            text_ack: true,
+            text_ack: false,
             chat_action: false,
             reply_threading: true,
             inbound_attachments: true,
@@ -399,18 +401,11 @@ impl FeishuChannelHandle {
         Ok(())
     }
 
-    /// stop 完成后回复 done，适用于用户确认取消已经落地。
+    /// stop 完成后添加完成 reaction，适用于用附属表情确认取消已落地。
     pub async fn acknowledge_stop(&self, message: &InboundMessage) -> AppResult<()> {
-        let (recipient, chat_id) = crate::message::outbound_target_from_source(&message.source);
-        let reply = OutboundMessage {
-            channel_name: self.name.clone(),
-            chat_id,
-            recipient,
-            text: "done".to_string(),
-            reply_to: message.message_id.clone(),
-            format: crate::message::OutboundFormat::Text,
-        };
-        self.send(reply).await?;
+        if let Some(message_id) = message.message_id.as_deref() {
+            self.api.add_done_reaction(message_id).await?;
+        }
         Ok(())
     }
 }
@@ -981,8 +976,9 @@ impl Channel for FeishuChannel {
     /// 返回飞书确认能力，适用于 daemon 统一确认语义。
     fn ack_capability(&self, kind: ChannelAckKind) -> ChannelAckCapability {
         match kind {
-            ChannelAckKind::StopDone => ChannelAckCapability::TextReply,
-            ChannelAckKind::Received | ChannelAckKind::ResetDone => ChannelAckCapability::Reaction,
+            ChannelAckKind::Received | ChannelAckKind::ResetDone | ChannelAckKind::StopDone => {
+                ChannelAckCapability::Reaction
+            }
         }
     }
 
@@ -993,7 +989,7 @@ impl Channel for FeishuChannel {
             append_update: false,
             request_user_input: true,
             reaction_ack: true,
-            text_ack: true,
+            text_ack: false,
             chat_action: false,
             reply_threading: true,
             inbound_attachments: true,

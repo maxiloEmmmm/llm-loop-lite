@@ -12,6 +12,7 @@ use crate::config::AppConfig;
 use crate::error::AppResult;
 use crate::home::AppPaths;
 use crate::message::{InboundAttachment, MessageSource};
+use crate::provider::limits::ModelLimits;
 use crate::session::SessionState;
 use crate::session_store::ConversationItem;
 use crate::tools::ToolRegistry;
@@ -39,6 +40,14 @@ pub enum BuiltinProvider {
 }
 
 impl Provider for BuiltinProvider {
+    /// 按枚举分支返回当前 provider 的模型限制。
+    fn model_limits(&self) -> ModelLimits {
+        match self {
+            Self::Codex(provider) => provider.model_limits(),
+            Self::Claude(provider) => provider.model_limits(),
+        }
+    }
+
     /// 按枚举分支静态分发 provider 请求。
     async fn complete(
         &self,
@@ -96,6 +105,9 @@ impl Provider for BuiltinProvider {
 /// provider 抽象，负责把 session + user input 转成模型回复。
 #[allow(async_fn_in_trait)]
 pub trait Provider: Send + Sync {
+    /// 返回当前模型限制，适用于 daemon 获取上下文预算而不理解 provider 细节。
+    fn model_limits(&self) -> ModelLimits;
+
     /// 生成回复，适用于 daemon 收到普通文本消息后调用。
     async fn complete(
         &self,

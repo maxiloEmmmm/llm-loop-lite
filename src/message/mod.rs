@@ -227,6 +227,11 @@ impl InboundMessage {
         is_stop_command_text(&self.text)
     }
 
+    /// 判断消息是否为 `/status` 命令。
+    pub fn is_status_command(&self) -> bool {
+        is_status_command_text(&self.text)
+    }
+
     /// 判断消息是否来自本地 cron，适用于 daemon 做计划任务专用限流。
     pub fn is_cron_task(&self) -> bool {
         self.scheduled
@@ -238,10 +243,7 @@ fn is_reset_command_text(text: &str) -> bool {
     // 触发条件：飞书群聊文本会把 @ 机器人保留成 @_user_1。
     // 不能直接精确匹配原文：群里必须 @ 才能触发机器人。
     // 防止回归：@机器人 /reset 不再落入 provider 生成文字回复。
-    let mut parts = text
-        .split_whitespace()
-        .skip_while(|part| is_mention_placeholder(part));
-    matches!(parts.next(), Some("/reset")) && parts.next().is_none()
+    is_single_command_text(text, "/reset")
 }
 
 /// 判断 stop 命令文本，适用于群聊里 @ 机器人后取消当前请求。
@@ -249,10 +251,23 @@ fn is_stop_command_text(text: &str) -> bool {
     // 触发条件：同一会话已有 provider 请求正在等待上游返回。
     // 不能走常规 provider 路径：它会被 session 串行锁挡住。
     // 防止回归：@机器人 /stop 不再排队到当前请求之后。
+    is_single_command_text(text, "/stop")
+}
+
+/// 判断 status 命令文本，适用于不经过 provider 直接返回服务状态。
+fn is_status_command_text(text: &str) -> bool {
+    // 触发条件：用户只想查看运行态而不是向模型提问。
+    // 不能走常规 provider 路径：状态查询会额外消耗 token 且可能排队。
+    // 防止回归：@机器人 /status 不再进入模型上下文。
+    is_single_command_text(text, "/status")
+}
+
+/// 判断单个斜杠命令，适用于复用 mention 前缀清理规则。
+fn is_single_command_text(text: &str, command: &str) -> bool {
     let mut parts = text
         .split_whitespace()
         .skip_while(|part| is_mention_placeholder(part));
-    matches!(parts.next(), Some("/stop")) && parts.next().is_none()
+    matches!(parts.next(), Some(part) if part == command) && parts.next().is_none()
 }
 
 /// 判断是否是平台 mention 占位，适用于命令识别前清理前缀。
