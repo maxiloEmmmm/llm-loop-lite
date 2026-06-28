@@ -528,6 +528,7 @@ impl Daemon {
             recipient,
             text: outbound_text,
             reply_to: message.message_id,
+            thread_id: message.source.thread_id,
             format: OutboundFormat::Text,
         };
         if let Err(send_err) = tool_channel.send(outbound).await {
@@ -633,6 +634,7 @@ impl Daemon {
                 recipient,
                 text,
                 reply_to: message.message_id.clone(),
+                thread_id: message.source.thread_id.clone(),
                 format: OutboundFormat::Text,
             })
             .await?;
@@ -730,6 +732,7 @@ impl Daemon {
             recipient,
             text,
             reply_to: message.message_id.clone(),
+            thread_id: message.source.thread_id.clone(),
             format: OutboundFormat::Text,
         };
         if let Err(err) = channel.send(outbound).await {
@@ -782,6 +785,7 @@ impl Daemon {
             recipient,
             text: format!("[{reply_hash}] {desc}"),
             reply_to: message.message_id.clone(),
+            thread_id: message.source.thread_id.clone(),
             format: OutboundFormat::Text,
         };
         let _ = tool_channel.send(outbound).await?;
@@ -873,6 +877,13 @@ impl Daemon {
     /// 获取指定 session key 的处理锁。
     async fn session_lock(&self, session_key: &str) -> Arc<Mutex<()>> {
         let mut locks = self.session_locks.lock().await;
+        // 触发条件：不同会话不断进入，旧 key 没有活跃任务持有锁。
+        // 不能在消息结束处异步回收，Drop 里不能 await 外层表锁。
+        // 防止回归：长时间运行后 session_locks 按历史会话数只增不减。
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        if locks.capacity() > 64 && locks.len().saturating_mul(4) < locks.capacity() {
+            locks.shrink_to_fit();
+        }
         locks
             .entry(session_key.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
@@ -1157,8 +1168,17 @@ struct SingleReplyChannel {
     inner: Arc<dyn crate::tools::registry::ToolChannel>,
     /// 当前入站消息 id，第一次发送时用它创建回复关系。
     inbound_message_id: Option<String>,
-    /// 本轮已经创建的机器人回复消息 id。
-    reply_message_id: Mutex<Option<String>>,
+    /// 本轮已经创建的机器人回复目标。
+    reply_target: Mutex<Option<SingleReplyTarget>>,
+}
+
+/// 单轮机器人回复目标，适用于后续直接更新同一条平台消息。
+#[derive(Clone)]
+struct SingleReplyTarget {
+    /// 平台返回的机器人消息 id。
+    message_id: String,
+    /// 目标 chat id。
+    chat_id: String,
 }
 
 impl SingleReplyChannel {
@@ -1170,7 +1190,7 @@ impl SingleReplyChannel {
         Self {
             inner,
             inbound_message_id,
-            reply_message_id: Mutex::new(None),
+            reply_target: Mutex::new(None),
         }
     }
 }
@@ -1179,52 +1199,65 @@ impl SingleReplyChannel {
 impl ToolChannel for SingleReplyChannel {
     /// 第一次真实发送，后续发送都改同一条机器人回复。
     async fn send(&self, mut message: OutboundMessage) -> AppResult<SendResult> {
-        let mut reply_message_id = self.reply_message_id.lock().await;
-        if let Some(message_id) = reply_message_id.clone() {
+        if matches!(message.format, OutboundFormat::Plan) {
+            return self.inner.send(message).await;
+        }
+        let mut reply_target = self.reply_target.lock().await;
+        if let Some(target) = reply_target.clone() {
             let result = self
                 .inner
                 .update_message(MessageUpdate {
                     channel_name: message.channel_name,
-                    message_id: message_id.clone(),
+                    chat_id: Some(target.chat_id),
+                    message_id: target.message_id.clone(),
                     text: message.text,
                     format: message.format,
                 })
                 .await?;
             return Ok(SendResult {
                 success: result.success,
-                message_id: Some(message_id),
+                message_id: Some(target.message_id),
             });
         }
 
         message.reply_to = self.inbound_message_id.clone();
+        let chat_id = message.chat_id.clone();
         let result = self.inner.send(message).await?;
         if let Some(message_id) = result.message_id.clone() {
-            *reply_message_id = Some(message_id);
+            *reply_target = Some(SingleReplyTarget {
+                message_id,
+                chat_id,
+            });
         }
         Ok(result)
     }
 
     /// 更新当前机器人回复；如果还没记录到本轮回复，则按传入 id 更新。
     async fn update_message(&self, message: MessageUpdate) -> AppResult<SendResult> {
-        let mut reply_message_id = self.reply_message_id.lock().await;
-        let target_message_id = reply_message_id
-            .clone()
-            .unwrap_or_else(|| message.message_id.clone());
+        if matches!(message.format, OutboundFormat::Plan) {
+            return self.inner.update_message(message).await;
+        }
+        let mut reply_target = self.reply_target.lock().await;
+        let target = reply_target.clone().unwrap_or_else(|| SingleReplyTarget {
+            message_id: message.message_id.clone(),
+            chat_id: message.chat_id.clone().unwrap_or_default(),
+        });
         let result = self
             .inner
             .update_message(MessageUpdate {
                 channel_name: message.channel_name,
-                message_id: target_message_id.clone(),
+                chat_id: Some(target.chat_id.clone()),
+                message_id: target.message_id.clone(),
                 text: message.text,
                 format: message.format,
             })
             .await?;
-        if reply_message_id.is_none() {
-            *reply_message_id = Some(target_message_id.clone());
+        if reply_target.is_none() {
+            *reply_target = Some(target.clone());
         }
         Ok(SendResult {
             success: result.success,
-            message_id: Some(target_message_id),
+            message_id: Some(target.message_id),
         })
     }
 

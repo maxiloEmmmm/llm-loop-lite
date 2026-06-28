@@ -56,6 +56,8 @@ pub struct OutboundMessage {
     pub text: String,
     /// 需要回复的原消息 id。
     pub reply_to: Option<String>,
+    /// 目标话题或线程 id，适用于 Telegram topic 这类会话内分流。
+    pub thread_id: Option<String>,
     /// 出站消息格式。
     pub format: OutboundFormat,
 }
@@ -65,6 +67,8 @@ pub struct OutboundMessage {
 pub struct MessageUpdate {
     /// 目标 channel 实例名。
     pub channel_name: String,
+    /// 目标 chat id，适用于不通过历史缓存直接更新平台消息。
+    pub chat_id: Option<String>,
     /// 平台返回的原消息 id。
     pub message_id: String,
     /// 更新后的正文。

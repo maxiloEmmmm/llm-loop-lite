@@ -296,12 +296,15 @@ impl ToolHandler for WriteStdinHandler {
             },
         )))
         .await;
-        let output = collect_running_output(
+        let (output, finished) = collect_running_output(
             process,
             Some(args.session_id),
             args.max_output_tokens.unwrap_or(10_000),
         )
         .await?;
+        if finished {
+            sessions.processes.remove(&args.session_id);
+        }
         Ok(ToolResult {
             output_kind: ToolOutputKind::Function,
             call_id: call.call_id,
@@ -476,7 +479,7 @@ async fn collect_running_output(
     process: &mut RunningProcess,
     session_id: Option<u64>,
     max_output_tokens: usize,
-) -> AppResult<Value> {
+) -> AppResult<(Value, bool)> {
     if let Some(stdout) = process.child.stdout.as_mut() {
         let mut buf = vec![0_u8; 8192];
         if let Ok(Ok(n)) =
@@ -496,12 +499,16 @@ async fn collect_running_output(
     let status = process.child.try_wait()?;
     let mut output = process.stdout.clone();
     output.extend_from_slice(&process.stderr);
-    Ok(command_output(
-        process.started,
-        status.and_then(|status| status.code()),
-        status.is_none().then_some(session_id).flatten(),
-        output,
-        max_output_tokens,
+    let is_running = status.is_none();
+    Ok((
+        command_output(
+            process.started,
+            status.and_then(|status| status.code()),
+            is_running.then_some(session_id).flatten(),
+            output,
+            max_output_tokens,
+        ),
+        !is_running,
     ))
 }
 

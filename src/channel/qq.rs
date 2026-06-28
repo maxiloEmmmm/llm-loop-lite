@@ -177,6 +177,7 @@ impl QqChannelHandle {
             recipient,
             text,
             reply_to,
+            thread_id: _,
             format: _,
         } = message;
         let cached_target = if let Some(reply_to) = reply_to.as_deref() {
@@ -338,6 +339,7 @@ impl QqChannelHandle {
             recipient,
             text: "已重置。".to_string(),
             reply_to: message.message_id.clone(),
+            thread_id: message.source.thread_id.clone(),
             format: crate::message::OutboundFormat::Text,
         };
         self.send(reply).await?;
@@ -353,6 +355,7 @@ impl QqChannelHandle {
             recipient,
             text: "done".to_string(),
             reply_to: message.message_id.clone(),
+            thread_id: message.source.thread_id.clone(),
             format: crate::message::OutboundFormat::Text,
         };
         self.send(reply).await?;

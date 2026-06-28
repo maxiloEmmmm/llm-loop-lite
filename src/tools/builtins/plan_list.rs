@@ -185,6 +185,7 @@ impl ToolHandler for PlanListHandler {
                 recipient,
                 text,
                 reply_to: None,
+                thread_id: context.source.thread_id.clone(),
                 format: OutboundFormat::Plan,
             })
             .await?;
@@ -305,6 +306,7 @@ impl ToolHandler for PlanListUpdateHandler {
         let text = render_state_message(state, &context.session.key);
         let update = MessageUpdate {
             channel_name: state.channel_name.clone(),
+            chat_id: Some(state.chat_id.clone()),
             message_id: state.message_id.clone(),
             text,
             format: OutboundFormat::Plan,
@@ -412,6 +414,7 @@ impl ToolHandler for PlanListEditHandler {
         let text = render_state_message(state, &context.session.key);
         let update = MessageUpdate {
             channel_name: state.channel_name.clone(),
+            chat_id: Some(state.chat_id.clone()),
             message_id: state.message_id.clone(),
             text,
             format: OutboundFormat::Plan,
@@ -470,6 +473,7 @@ impl ToolHandler for PlanListDoneHandler {
         text.push_str("\n\n汇总中...");
         let update = MessageUpdate {
             channel_name: state.channel_name.clone(),
+            chat_id: Some(state.chat_id.clone()),
             message_id: state.message_id.clone(),
             text,
             format: OutboundFormat::Plan,
@@ -590,6 +594,7 @@ impl PlanStates {
         let text = render_state_message(state, session_key);
         let update = MessageUpdate {
             channel_name: state.channel_name.clone(),
+            chat_id: Some(state.chat_id.clone()),
             message_id: state.message_id.clone(),
             text,
             format: OutboundFormat::Plan,

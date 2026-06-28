@@ -9,6 +9,7 @@ mod plan_list;
 mod shell;
 mod sleep;
 mod user_input;
+mod web;
 
 use std::sync::Arc;
 
@@ -36,5 +37,7 @@ pub fn handlers() -> Vec<Arc<dyn ToolHandler>> {
         Arc::new(context::NewContextHandler),
         Arc::new(context::GetContextRemainingHandler),
         Arc::new(sleep::SleepHandler),
+        Arc::new(web::WebSearchHandler),
+        Arc::new(web::WebFetchHandler),
     ]
 }

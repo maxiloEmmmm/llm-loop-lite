@@ -1,15 +1,16 @@
 //! Telegram Bot API channel 实现。
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::channel::attachments::{DownloadedAttachment, store_inbound_attachment};
 use crate::channel::{Channel, ChannelAckCapability, ChannelAckKind, ChannelCapabilities};
 use crate::config::{ChannelConfig, TelegramChannelConfig};
 use crate::error::{AppError, AppResult};
@@ -22,8 +23,8 @@ use crate::resource::{ResourceUsage, estimate_answers_bytes, estimate_user_input
 
 /// TG 收到消息后的确认 reaction，使用普通 emoji 避免自定义表情权限限制。
 const TELEGRAM_RECEIVED_REACTION_EMOJI: &str = "\u{1F440}";
-/// TG 命令完成后的确认 reaction，适用于 stop/reset 这类短确认。
-const TELEGRAM_DONE_REACTION_EMOJI: &str = "\u{2705}";
+/// TG 命令完成后的确认 reaction，复用已确认可用的普通 emoji。
+const TELEGRAM_DONE_REACTION_EMOJI: &str = "\u{1F440}";
 
 /// Telegram Bot API channel，负责 polling 收消息和 REST 发消息。
 pub struct TelegramChannel {
@@ -37,12 +38,8 @@ pub struct TelegramChannel {
     polling: TelegramPollingConfig,
     /// 消息处理配置。
     behavior: TelegramBehaviorConfig,
-    /// 消息去重状态。
-    seen: Arc<Mutex<TelegramDedupCache>>,
     /// 等待中的用户输入请求。
     user_inputs: Arc<Mutex<TelegramPendingUserInputs>>,
-    /// 已发送消息目标缓存。
-    sent_messages: Arc<Mutex<TelegramSentMessages>>,
     /// 后台 polling 任务。
     task: Option<JoinHandle<()>>,
 }
@@ -54,12 +51,8 @@ pub struct TelegramChannelHandle {
     name: String,
     /// Telegram REST API。
     api: Arc<TelegramApi>,
-    /// 消息去重状态。
-    seen: Arc<Mutex<TelegramDedupCache>>,
     /// 等待中的用户输入请求。
     user_inputs: Arc<Mutex<TelegramPendingUserInputs>>,
-    /// 已发送消息目标缓存。
-    sent_messages: Arc<Mutex<TelegramSentMessages>>,
     /// 是否启用收到消息确认。
     received_ack_enabled: bool,
     /// 是否下载入站附件。
@@ -110,37 +103,6 @@ struct TelegramApi {
     file_base_url: String,
     /// HTTP 客户端。
     client: reqwest::Client,
-}
-
-/// Telegram 发送目标缓存项。
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TelegramSentMessageTarget {
-    /// Telegram chat_id。
-    chat_id: String,
-    /// forum topic id。
-    message_thread_id: Option<i64>,
-}
-
-/// Telegram 已发送消息目标缓存。
-#[derive(Debug)]
-struct TelegramSentMessages {
-    /// 缓存容量。
-    capacity: usize,
-    /// 插入顺序。
-    order: VecDeque<String>,
-    /// message_id 到目标的映射。
-    items: HashMap<String, TelegramSentMessageTarget>,
-}
-
-/// Telegram 消息去重缓存。
-#[derive(Debug)]
-struct TelegramDedupCache {
-    /// 缓存容量。
-    capacity: usize,
-    /// 插入顺序。
-    order: VecDeque<String>,
-    /// 已见 key。
-    seen: HashSet<String>,
 }
 
 /// Telegram 等待中的用户输入。
@@ -323,10 +285,6 @@ struct TelegramCallbackQuery {
 struct TelegramSentMessage {
     /// 消息 id。
     message_id: i64,
-    /// 所在 chat。
-    chat: TelegramChat,
-    /// forum topic id。
-    message_thread_id: Option<i64>,
 }
 
 impl TelegramChannel {
@@ -353,13 +311,7 @@ impl TelegramChannel {
                 download_attachments: config.telegram.download_attachments,
                 max_download_bytes: config.telegram.max_download_bytes,
             },
-            seen: Arc::new(Mutex::new(TelegramDedupCache::new(
-                config.telegram.dedup_cache_size.max(1),
-            ))),
             user_inputs: Arc::new(Mutex::new(TelegramPendingUserInputs::default())),
-            sent_messages: Arc::new(Mutex::new(TelegramSentMessages::new(
-                config.telegram.dedup_cache_size.max(1),
-            ))),
             task: None,
         })
     }
@@ -369,9 +321,7 @@ impl TelegramChannel {
         TelegramChannelHandle {
             name: self.name.clone(),
             api: Arc::clone(&self.api),
-            seen: Arc::clone(&self.seen),
             user_inputs: Arc::clone(&self.user_inputs),
-            sent_messages: Arc::clone(&self.sent_messages),
             received_ack_enabled: self.behavior.send_typing,
             download_attachments: self.behavior.download_attachments,
         }
@@ -427,18 +377,10 @@ impl TelegramChannelHandle {
     /// 返回 Telegram 句柄持有的缓存资源估算。
     pub async fn resource_usage(&self) -> Vec<ResourceUsage> {
         vec![
-            self.seen
-                .lock()
-                .await
-                .resource_usage("channel.telegram.dedup"),
             self.user_inputs
                 .lock()
                 .await
                 .resource_usage("channel.telegram.pending_inputs"),
-            self.sent_messages
-                .lock()
-                .await
-                .resource_usage("channel.telegram.sent_messages"),
         ]
     }
 
@@ -466,14 +408,10 @@ impl TelegramChannelHandle {
             recipient: _,
             text,
             reply_to,
+            thread_id,
             format: _,
         } = message;
-        let message_thread_id = self
-            .sent_messages
-            .lock()
-            .await
-            .get(reply_to.as_deref().unwrap_or(""))
-            .and_then(|target| target.message_thread_id);
+        let message_thread_id = thread_id.as_deref().and_then(parse_i64);
         let sent = self
             .api
             .send_message(
@@ -485,13 +423,6 @@ impl TelegramChannelHandle {
             )
             .await?;
         let message_id = sent.message_id.to_string();
-        self.sent_messages.lock().await.insert(
-            message_id.clone(),
-            TelegramSentMessageTarget {
-                chat_id: sent.chat.id.to_string(),
-                message_thread_id: sent.message_thread_id,
-            },
-        );
         Ok(SendResult {
             success: true,
             message_id: Some(message_id),
@@ -500,20 +431,15 @@ impl TelegramChannelHandle {
 
     /// 更新 Telegram 消息。
     pub async fn update_message(&self, message: MessageUpdate) -> AppResult<SendResult> {
-        let target = self
-            .sent_messages
-            .lock()
-            .await
-            .get(&message.message_id)
-            .ok_or_else(|| {
-                AppError::Channel(format!(
-                    "telegram update target is missing for message_id={}",
-                    message.message_id
-                ))
-            })?;
+        let chat_id = message.chat_id.as_deref().ok_or_else(|| {
+            AppError::Channel(format!(
+                "telegram update chat_id is missing for message_id={}",
+                message.message_id
+            ))
+        })?;
         let message_id = parse_message_id(&message.message_id)?;
         self.api
-            .edit_message_text(&target.chat_id, message_id, &message.text)
+            .edit_message_text(chat_id, message_id, &message.text)
             .await?;
         Ok(SendResult {
             success: true,
@@ -573,7 +499,7 @@ impl TelegramChannelHandle {
                 .set_message_reaction(
                     &message.source.chat_id,
                     message_id,
-                    TELEGRAM_DONE_REACTION_EMOJI,
+                    TELEGRAM_RECEIVED_REACTION_EMOJI,
                     true,
                 )
                 .await
@@ -655,12 +581,10 @@ impl Channel for TelegramChannel {
         let name = self.name.clone();
         let polling = self.polling.clone();
         let behavior = self.behavior.clone();
-        let seen = Arc::clone(&self.seen);
         let user_inputs = Arc::clone(&self.user_inputs);
-        let sent_messages = Arc::clone(&self.sent_messages);
         let bot_username = Arc::clone(&self.bot_username);
         let offset_path = telegram_offset_path(paths, &name);
-        let store_dir = paths.channel_store_dir.join("telegram").join(&name);
+        let store_root = paths.channel_store_dir.clone();
         self.task = Some(tokio::spawn(async move {
             loop {
                 match run_telegram_polling(
@@ -669,12 +593,10 @@ impl Channel for TelegramChannel {
                     name.clone(),
                     polling.clone(),
                     behavior.clone(),
-                    Arc::clone(&seen),
                     Arc::clone(&user_inputs),
-                    Arc::clone(&sent_messages),
                     Arc::clone(&bot_username),
                     offset_path.clone(),
-                    store_dir.clone(),
+                    store_root.clone(),
                 )
                 .await
                 {
@@ -693,7 +615,6 @@ impl Channel for TelegramChannel {
             task.abort();
         }
         self.user_inputs.lock().await.clear();
-        self.sent_messages.lock().await.clear();
         Ok(())
     }
 
@@ -999,121 +920,6 @@ impl TelegramApi {
     }
 }
 
-impl TelegramDedupCache {
-    /// 创建 Telegram 去重缓存。
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            order: VecDeque::new(),
-            seen: HashSet::new(),
-        }
-    }
-
-    /// 首次看到 key 时返回 true。
-    fn insert_new(&mut self, key: String) -> bool {
-        if self.seen.contains(&key) {
-            return false;
-        }
-        self.seen.insert(key.clone());
-        self.order.push_back(key);
-        while self.order.len() > self.capacity {
-            if let Some(old) = self.order.pop_front() {
-                self.seen.remove(&old);
-            }
-        }
-        true
-    }
-
-    /// 返回 Telegram 去重缓存资源估算。
-    fn resource_usage(&self, name: &str) -> ResourceUsage {
-        let order_bytes = self
-            .order
-            .capacity()
-            .saturating_mul(std::mem::size_of::<String>())
-            .saturating_add(self.order.iter().map(String::capacity).sum::<usize>());
-        let seen_bytes = self
-            .seen
-            .capacity()
-            .saturating_mul(std::mem::size_of::<String>())
-            .saturating_add(self.seen.iter().map(String::capacity).sum::<usize>());
-        ResourceUsage::new(
-            name,
-            "cache",
-            self.seen.len(),
-            Some(self.capacity),
-            order_bytes.saturating_add(seen_bytes),
-        )
-    }
-}
-
-impl TelegramSentMessages {
-    /// 创建已发送消息缓存。
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            order: VecDeque::new(),
-            items: HashMap::new(),
-        }
-    }
-
-    /// 写入已发送消息目标。
-    fn insert(&mut self, message_id: String, target: TelegramSentMessageTarget) {
-        if !self.items.contains_key(&message_id) {
-            self.order.push_back(message_id.clone());
-        }
-        self.items.insert(message_id, target);
-        while self.order.len() > self.capacity {
-            if let Some(old) = self.order.pop_front() {
-                self.items.remove(&old);
-            }
-        }
-    }
-
-    /// 读取已发送消息目标。
-    fn get(&self, message_id: &str) -> Option<TelegramSentMessageTarget> {
-        self.items.get(message_id).cloned()
-    }
-
-    /// 清空已发送消息目标。
-    fn clear(&mut self) {
-        self.order.clear();
-        self.items.clear();
-    }
-
-    /// 返回已发送消息缓存资源估算。
-    fn resource_usage(&self, name: &str) -> ResourceUsage {
-        let order_bytes = self
-            .order
-            .capacity()
-            .saturating_mul(std::mem::size_of::<String>())
-            .saturating_add(self.order.iter().map(String::capacity).sum::<usize>());
-        let item_bytes = self
-            .items
-            .capacity()
-            .saturating_mul(std::mem::size_of::<(String, TelegramSentMessageTarget)>())
-            .saturating_add(
-                self.items
-                    .iter()
-                    .map(|(key, target)| {
-                        key.capacity()
-                            + target.chat_id.capacity()
-                            + target
-                                .message_thread_id
-                                .map(|_| std::mem::size_of::<i64>())
-                                .unwrap_or(0)
-                    })
-                    .sum::<usize>(),
-            );
-        ResourceUsage::new(
-            name,
-            "cache",
-            self.items.len(),
-            Some(self.capacity),
-            order_bytes.saturating_add(item_bytes),
-        )
-    }
-}
-
 impl TelegramPendingUserInputs {
     /// 插入等待中的用户输入请求。
     fn insert(
@@ -1233,12 +1039,10 @@ async fn run_telegram_polling(
     channel_name: String,
     polling: TelegramPollingConfig,
     behavior: TelegramBehaviorConfig,
-    seen: Arc<Mutex<TelegramDedupCache>>,
     user_inputs: Arc<Mutex<TelegramPendingUserInputs>>,
-    sent_messages: Arc<Mutex<TelegramSentMessages>>,
     bot_username: Arc<Mutex<Option<String>>>,
     offset_path: PathBuf,
-    store_dir: PathBuf,
+    store_root: PathBuf,
 ) -> AppResult<()> {
     if polling.delete_webhook_on_start {
         let _ = api.delete_webhook().await?;
@@ -1254,7 +1058,7 @@ async fn run_telegram_polling(
         me.first_name
     );
     *bot_username.lock().await = me.username.clone();
-    tokio::fs::create_dir_all(&store_dir).await?;
+    tokio::fs::create_dir_all(&store_root).await?;
     let mut offset = read_offset(&offset_path).await?;
     loop {
         let updates = api
@@ -1263,18 +1067,14 @@ async fn run_telegram_polling(
         for update in updates {
             offset = Some(update.update_id.saturating_add(1));
             write_offset(&offset_path, offset).await?;
-            if !seen.lock().await.insert_new(update.update_id.to_string()) {
-                continue;
-            }
             handle_update(
                 Arc::clone(&api),
                 tx.clone(),
                 &channel_name,
                 &behavior,
-                &store_dir,
+                &store_root,
                 &bot_username.lock().await.clone(),
                 Arc::clone(&user_inputs),
-                Arc::clone(&sent_messages),
                 update,
             )
             .await?;
@@ -1288,10 +1088,9 @@ async fn handle_update(
     tx: mpsc::Sender<InboundMessage>,
     channel_name: &str,
     behavior: &TelegramBehaviorConfig,
-    store_dir: &Path,
+    store_root: &Path,
     bot_username: &Option<String>,
     user_inputs: Arc<Mutex<TelegramPendingUserInputs>>,
-    sent_messages: Arc<Mutex<TelegramSentMessages>>,
     update: TelegramUpdate,
 ) -> AppResult<()> {
     if let Some(callback) = update.callback_query {
@@ -1308,9 +1107,8 @@ async fn handle_update(
             api,
             channel_name,
             behavior,
-            store_dir,
+            store_root,
             bot_username,
-            Arc::clone(&sent_messages),
             message,
         )
         .await?
@@ -1371,9 +1169,8 @@ async fn telegram_message_to_inbound(
     api: Arc<TelegramApi>,
     channel_name: &str,
     behavior: &TelegramBehaviorConfig,
-    store_dir: &Path,
+    store_root: &Path,
     bot_username: &Option<String>,
-    sent_messages: Arc<Mutex<TelegramSentMessages>>,
     message: TelegramMessage,
 ) -> AppResult<Option<InboundMessage>> {
     let mut text = message
@@ -1391,13 +1188,6 @@ async fn telegram_message_to_inbound(
         text = cleaned;
     }
     let source = telegram_source(channel_name, &message);
-    sent_messages.lock().await.insert(
-        message.message_id.to_string(),
-        TelegramSentMessageTarget {
-            chat_id: message.chat.id.to_string(),
-            message_thread_id: message.message_thread_id,
-        },
-    );
     let mut inbound = InboundMessage::text(
         if text.trim().is_empty() {
             "用户发送了附件".to_string()
@@ -1410,7 +1200,7 @@ async fn telegram_message_to_inbound(
     if behavior.download_attachments {
         attach_telegram_files(
             api,
-            store_dir,
+            store_root,
             behavior.max_download_bytes,
             &message,
             &mut inbound,
@@ -1451,7 +1241,7 @@ fn telegram_source(channel_name: &str, message: &TelegramMessage) -> MessageSour
 /// 下载并挂载 Telegram 附件。
 async fn attach_telegram_files(
     api: Arc<TelegramApi>,
-    store_dir: &Path,
+    store_root: &Path,
     max_download_bytes: u64,
     message: &TelegramMessage,
     inbound: &mut InboundMessage,
@@ -1459,10 +1249,27 @@ async fn attach_telegram_files(
     if let Some(photo) = message.photo.as_ref().and_then(|photos| best_photo(photos)) {
         let bytes =
             download_telegram_file(api.as_ref(), &photo.file_id, max_download_bytes).await?;
-        inbound.attachments.push(InboundAttachment::Image {
-            mime_type: "image/jpeg".to_string(),
-            bytes,
-        });
+        let filename = format!("{}.jpg", photo._file_unique_id);
+        match store_inbound_attachment(
+            store_root,
+            &inbound.source,
+            DownloadedAttachment {
+                filename: &filename,
+                mime_type: "image/jpeg",
+                bytes: &bytes,
+            },
+        )
+        .await
+        {
+            Ok(stored) => inbound.attachments.push(stored),
+            Err(err) => {
+                crate::log_info!(
+                    "telegram photo store failed file_id={} error={}",
+                    photo.file_id,
+                    err
+                );
+            }
+        }
     }
     for meta in [
         message.document.as_ref(),
@@ -1500,16 +1307,31 @@ async fn attach_telegram_files(
             .file_name
             .clone()
             .unwrap_or_else(|| telegram_download_filename(&file, file_path));
-        let path = store_telegram_file(store_dir, &filename, &bytes).await?;
-        inbound.attachments.push(InboundAttachment::StoredFile {
-            path,
-            filename,
-            mime_type: meta
-                .mime_type
-                .clone()
-                .unwrap_or_else(|| "application/octet-stream".to_string()),
-            size: bytes.len() as u64,
-        });
+        let mime_type = meta
+            .mime_type
+            .clone()
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        match store_inbound_attachment(
+            store_root,
+            &inbound.source,
+            DownloadedAttachment {
+                filename: &filename,
+                mime_type: &mime_type,
+                bytes: &bytes,
+            },
+        )
+        .await
+        {
+            Ok(stored) => inbound.attachments.push(stored),
+            Err(err) => {
+                crate::log_info!(
+                    "telegram file store failed file_id={} filename={} error={}",
+                    meta.file_id,
+                    filename,
+                    err
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -1534,18 +1356,6 @@ async fn download_telegram_file(
         ));
     };
     api.download_file(file_path, max_download_bytes).await
-}
-
-/// 将 Telegram 文件写入本地附件目录。
-async fn store_telegram_file(store_dir: &Path, filename: &str, bytes: &[u8]) -> AppResult<PathBuf> {
-    tokio::fs::create_dir_all(store_dir).await?;
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let path = store_dir.join(format!("{nanos}_{}", sanitize_filename(filename)));
-    tokio::fs::write(&path, bytes).await?;
-    Ok(path)
 }
 
 /// 选择最大 Telegram 图片。
@@ -1747,21 +1557,6 @@ fn split_telegram_text(text: &str) -> Vec<String> {
         chunks.push(current);
     }
     chunks
-}
-
-/// 清理文件名，避免平台文件名逃逸目录。
-fn sanitize_filename(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| match ch {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            other => other,
-        })
-        .collect::<String>()
-        .trim()
-        .chars()
-        .take(120)
-        .collect::<String>()
 }
 
 /// 解析 Telegram message_id。

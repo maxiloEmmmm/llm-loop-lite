@@ -18,6 +18,9 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use crate::channel::attachments::{
+    DownloadedAttachment, sanitize_filename, store_inbound_attachment,
+};
 use crate::channel::{Channel, ChannelAckCapability, ChannelAckKind, ChannelCapabilities};
 use crate::config::{ChannelConfig, FeishuChannelConfig};
 use crate::error::{AppError, AppResult};
@@ -30,8 +33,6 @@ use crate::resource::{
     ResourceUsage, estimate_answers_bytes, estimate_message_source_bytes,
     estimate_user_input_request_bytes,
 };
-use crate::session::build_message_key;
-use crate::store::store_hash;
 
 use api::{FeishuApi, FeishuMessageDetail, FeishuReceiveIdType, FeishuRecipient};
 use event::{FeishuEventEnvelope, FeishuReceiveMessageEvent};
@@ -159,7 +160,7 @@ impl FeishuChannel {
         if let Some(mut message) =
             event_to_inbound_message(&api, &event, name, api.platform_name(), &store_root).await?
         {
-            attach_images(&api, &event, &mut message).await;
+            attach_images(&api, &event, &mut message, &store_root).await;
             attach_files(&api, &event, &mut message, &store_root).await;
             let user_input_result = if message.attachments.is_empty()
                 && !message.is_reset_command()
@@ -567,7 +568,15 @@ async fn merged_message_item_content(
         return Ok(None);
     };
     let mut attachments = Vec::new();
-    attach_images_from_content(api, resource_message_id, content, &mut attachments).await;
+    attach_images_from_content(
+        api,
+        resource_message_id,
+        content,
+        source,
+        store_root,
+        &mut attachments,
+    )
+    .await;
     attach_files_from_content(
         api,
         resource_message_id,
@@ -690,16 +699,6 @@ async fn attach_files_from_content(
     if resources.is_empty() {
         return;
     }
-    let session_key = build_message_key(source);
-    let session_dir = store_root.join(store_hash(&session_key));
-    if let Err(err) = tokio::fs::create_dir_all(&session_dir).await {
-        crate::log_info!(
-            "feishu file store create failed dir={} error={}",
-            session_dir.display(),
-            err
-        );
-        return;
-    }
     for resource in resources {
         match api
             .download_message_file(message_id, &resource.file_key)
@@ -710,33 +709,44 @@ async fn attach_files_from_content(
                     .filename
                     .clone()
                     .unwrap_or_else(|| resource.file_key.clone());
-                let path = session_dir.join(format!(
-                    "{}_{}",
-                    store_hash(&resource.file_key),
-                    sanitize_filename(&filename)
-                ));
-                if let Err(err) = tokio::fs::write(&path, &file.bytes).await {
-                    crate::log_info!(
-                        "feishu file store write failed path={} error={}",
-                        path.display(),
-                        err
-                    );
-                    continue;
+                match store_inbound_attachment(
+                    store_root,
+                    source,
+                    DownloadedAttachment {
+                        filename: &filename,
+                        mime_type: &file.mime_type,
+                        bytes: &file.bytes,
+                    },
+                )
+                .await
+                {
+                    Ok(stored) => {
+                        let path = match &stored {
+                            InboundAttachment::StoredFile { path, .. } => {
+                                path.display().to_string()
+                            }
+                            InboundAttachment::Image { .. } => String::new(),
+                        };
+                        crate::log_info!(
+                            "feishu file stored message_id={} file_key={} path={} mime_type={} bytes={}",
+                            message_id,
+                            resource.file_key,
+                            path,
+                            file.mime_type,
+                            file.bytes.len()
+                        );
+                        attachments.push(stored);
+                    }
+                    Err(err) => {
+                        crate::log_info!(
+                            "feishu file store failed message_id={} file_key={} filename={} error={}",
+                            message_id,
+                            resource.file_key,
+                            filename,
+                            err
+                        );
+                    }
                 }
-                crate::log_info!(
-                    "feishu file stored message_id={} file_key={} path={} mime_type={} bytes={}",
-                    message_id,
-                    resource.file_key,
-                    path.display(),
-                    file.mime_type,
-                    file.bytes.len()
-                );
-                attachments.push(InboundAttachment::StoredFile {
-                    path,
-                    filename,
-                    mime_type: file.mime_type,
-                    size: file.bytes.len() as u64,
-                });
             }
             Err(err) => {
                 crate::log_info!(
@@ -755,11 +765,14 @@ async fn attach_images(
     api: &Arc<FeishuApi>,
     event: &FeishuReceiveMessageEvent,
     message: &mut InboundMessage,
+    store_root: &Path,
 ) {
     attach_images_from_content(
         api,
         &event.message.message_id,
         &event.message.content,
+        &message.source,
+        store_root,
         &mut message.attachments,
     )
     .await;
@@ -770,6 +783,8 @@ async fn attach_images_from_content(
     api: &Arc<FeishuApi>,
     message_id: &str,
     content: &str,
+    source: &MessageSource,
+    store_root: &Path,
     attachments: &mut Vec<InboundAttachment>,
 ) {
     let image_keys = event::image_keys_from_content(content);
@@ -779,17 +794,37 @@ async fn attach_images_from_content(
     for image_key in image_keys {
         match api.download_message_image(message_id, &image_key).await {
             Ok(image) => {
-                crate::log_info!(
-                    "feishu image attached message_id={} image_key={} mime_type={} bytes={}",
-                    message_id,
-                    image_key,
-                    image.mime_type,
-                    image.bytes.len()
-                );
-                attachments.push(InboundAttachment::Image {
-                    mime_type: image.mime_type,
-                    bytes: image.bytes,
-                });
+                let filename = format!("{image_key}.{}", image_extension(&image.mime_type));
+                match store_inbound_attachment(
+                    store_root,
+                    source,
+                    DownloadedAttachment {
+                        filename: &filename,
+                        mime_type: &image.mime_type,
+                        bytes: &image.bytes,
+                    },
+                )
+                .await
+                {
+                    Ok(stored) => {
+                        crate::log_info!(
+                            "feishu image stored message_id={} image_key={} mime_type={} bytes={}",
+                            message_id,
+                            image_key,
+                            image.mime_type,
+                            image.bytes.len()
+                        );
+                        attachments.push(stored);
+                    }
+                    Err(err) => {
+                        crate::log_info!(
+                            "feishu image store failed message_id={} image_key={} error={}",
+                            message_id,
+                            image_key,
+                            err
+                        );
+                    }
+                }
             }
             Err(err) => {
                 crate::log_info!(
@@ -1897,21 +1932,14 @@ fn log_preview(text: &str) -> String {
     output
 }
 
-/// 清理平台文件名，避免路径穿越和奇怪分隔符。
-fn sanitize_filename(filename: &str) -> String {
-    let cleaned = filename
-        .chars()
-        .map(|ch| match ch {
-            '/' | '\\' | ':' | '\0' => '_',
-            ch if ch.is_control() => '_',
-            ch => ch,
-        })
-        .collect::<String>();
-    let trimmed = cleaned.trim().trim_matches('.').to_string();
-    if trimmed.is_empty() {
-        "file".to_string()
-    } else {
-        trimmed
+/// 根据 MIME 类型选择图片扩展名，适用于落盘缺少文件名的飞书图片。
+fn image_extension(mime_type: &str) -> &'static str {
+    match mime_type {
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/jpeg" | "image/jpg" => "jpg",
+        _ => "img",
     }
 }
 

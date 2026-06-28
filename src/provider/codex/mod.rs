@@ -16,7 +16,7 @@ use crate::session::SessionState;
 use crate::session_store::ConversationItem;
 use crate::tools::ToolRegistry;
 use crate::tools::registry::{ToolChannel, ToolOutputKind};
-use crate::tools::spec::{ToolSpec, create_image_generation_tool, create_web_search_tool};
+use crate::tools::spec::{ToolSpec, create_image_generation_tool};
 
 use auth::ProviderRoute;
 use client::{
@@ -216,10 +216,7 @@ impl Provider for CodexProvider {
 /// 返回 Codex provider 支持的 hosted tools。
 fn provider_hosted_tool_specs(route: &ProviderRoute) -> Vec<ToolSpec> {
     if matches!(route.kind, auth::ProviderRouteKind::CodexOauth) {
-        vec![
-            create_web_search_tool(true),
-            create_image_generation_tool("png"),
-        ]
+        vec![create_image_generation_tool("png")]
     } else {
         Vec::new()
     }

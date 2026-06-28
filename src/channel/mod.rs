@@ -1,5 +1,6 @@
 use tokio::sync::mpsc;
 
+mod attachments;
 mod builtin;
 mod capability;
 mod feishu;
