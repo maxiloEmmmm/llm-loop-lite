@@ -7,11 +7,14 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::channel::attachments::{DownloadedAttachment, store_inbound_attachment};
-use crate::channel::{Channel, ChannelAckCapability, ChannelAckKind, ChannelCapabilities};
+use crate::channel::user_input::{PendingUserInputs, wait_for_user_input};
+use crate::channel::{
+    Channel, ChannelAckCapability, ChannelAckKind, ChannelCapabilities, resolve_channel_secret,
+};
 use crate::config::{ChannelConfig, TelegramChannelConfig};
 use crate::error::{AppError, AppResult};
 use crate::home::AppPaths;
@@ -19,7 +22,7 @@ use crate::message::{
     InboundAttachment, InboundMessage, MessageSource, MessageUpdate, OutboundMessage, SendResult,
     UserInputRequest, UserInputResponse,
 };
-use crate::resource::{ResourceUsage, estimate_answers_bytes, estimate_user_input_request_bytes};
+use crate::resource::ResourceUsage;
 
 /// TG 收到消息后的确认 reaction，使用普通 emoji 避免自定义表情权限限制。
 const TELEGRAM_RECEIVED_REACTION_EMOJI: &str = "\u{1F440}";
@@ -105,22 +108,8 @@ struct TelegramApi {
     client: reqwest::Client,
 }
 
-/// Telegram 等待中的用户输入。
-#[derive(Default)]
-struct TelegramPendingUserInputs {
-    /// 请求 id 到等待项。
-    requests: HashMap<String, TelegramPendingUserInput>,
-}
-
-/// Telegram 单个等待中的用户输入。
-struct TelegramPendingUserInput {
-    /// 原始问题。
-    request: UserInputRequest,
-    /// 已收集答案。
-    answers: HashMap<String, Vec<String>>,
-    /// 完成通知。
-    sender: Option<oneshot::Sender<UserInputResponse>>,
-}
+/// Telegram 等待输入集合，适用于 inline keyboard 回调，例如 `request -> response`。
+type TelegramPendingUserInputs = PendingUserInputs<()>;
 
 /// Telegram Bot API 响应包。
 #[derive(Debug, Deserialize)]
@@ -311,7 +300,7 @@ impl TelegramChannel {
                 download_attachments: config.telegram.download_attachments,
                 max_download_bytes: config.telegram.max_download_bytes,
             },
-            user_inputs: Arc::new(Mutex::new(TelegramPendingUserInputs::default())),
+            user_inputs: Arc::new(Mutex::new(PendingUserInputs::new())),
             task: None,
         })
     }
@@ -453,14 +442,9 @@ impl TelegramChannelHandle {
         source: &MessageSource,
         request: UserInputRequest,
     ) -> AppResult<UserInputResponse> {
-        let request_id = uuid::Uuid::new_v4().simple().to_string();
-        let (tx, rx) = oneshot::channel();
-        {
-            self.user_inputs
-                .lock()
-                .await
-                .insert(request_id.clone(), request.clone(), tx);
-        }
+        let timeout_ms = request.auto_resolution_ms;
+        let waiter = self.user_inputs.lock().await.start(request.clone(), ());
+        let request_id = waiter.request_id().to_string();
         let reply_markup = build_user_input_keyboard(&request_id, &request);
         if let Err(err) = self
             .api
@@ -476,18 +460,7 @@ impl TelegramChannelHandle {
             self.user_inputs.lock().await.remove(&request_id);
             return Err(err);
         }
-        if let Some(timeout_ms) = request.auto_resolution_ms {
-            match tokio::time::timeout(Duration::from_millis(timeout_ms), rx).await {
-                Ok(Ok(response)) => Ok(response),
-                Ok(Err(_)) => Err(AppError::Channel(
-                    "telegram user input waiter was closed".to_string(),
-                )),
-                Err(_) => self.user_inputs.lock().await.auto_resolve(&request_id),
-            }
-        } else {
-            rx.await
-                .map_err(|_| AppError::Channel("telegram user input waiter was closed".to_string()))
-        }
+        wait_for_user_input(&self.user_inputs, waiter, timeout_ms, "telegram").await
     }
 
     /// 收到入站消息后优先添加 reaction，失败时退回 typing。
@@ -678,17 +651,9 @@ impl Channel for TelegramChannel {
 impl ResolvedTelegramConfig {
     /// 解析 Telegram 配置，适用于启动前读取 token。
     fn resolve(config: &TelegramChannelConfig) -> AppResult<Self> {
-        let bot_token = config
-            .bot_token
-            .clone()
-            .or_else(|| {
-                config
-                    .bot_token_env
-                    .as_ref()
-                    .and_then(|key| std::env::var(key).ok())
-            })
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| AppError::Channel("telegram bot token is required".to_string()))?;
+        let bot_token =
+            resolve_channel_secret(config.bot_token.as_deref(), config.bot_token_env.as_deref())
+                .ok_or_else(|| AppError::Channel("telegram bot token is required".to_string()))?;
         Ok(Self {
             bot_token,
             api_base_url: config.api_base_url.clone(),
@@ -920,118 +885,6 @@ impl TelegramApi {
     }
 }
 
-impl TelegramPendingUserInputs {
-    /// 插入等待中的用户输入请求。
-    fn insert(
-        &mut self,
-        request_id: String,
-        request: UserInputRequest,
-        sender: oneshot::Sender<UserInputResponse>,
-    ) {
-        self.requests.insert(
-            request_id,
-            TelegramPendingUserInput {
-                request,
-                answers: HashMap::new(),
-                sender: Some(sender),
-            },
-        );
-    }
-
-    /// 移除等待中的用户输入请求。
-    fn remove(&mut self, request_id: &str) {
-        self.requests.remove(request_id);
-    }
-
-    /// 清空等待中的用户输入请求。
-    fn clear(&mut self) {
-        self.requests.clear();
-    }
-
-    /// 返回等待输入集合资源估算。
-    fn resource_usage(&self, name: &str) -> ResourceUsage {
-        let body_bytes = self
-            .requests
-            .iter()
-            .map(|(key, pending)| key.capacity().saturating_add(pending.resource_bytes()))
-            .sum::<usize>();
-        let entry_bytes = self
-            .requests
-            .capacity()
-            .saturating_mul(std::mem::size_of::<(String, TelegramPendingUserInput)>());
-        ResourceUsage::new(
-            name,
-            "hashmap",
-            self.requests.len(),
-            Some(self.requests.capacity()),
-            entry_bytes.saturating_add(body_bytes),
-        )
-    }
-
-    /// 处理 callback 选择。
-    fn answer_callback(
-        &mut self,
-        request_id: &str,
-        question_index: usize,
-        option_index: usize,
-    ) -> AppResult<Option<UserInputResponse>> {
-        let Some(pending) = self.requests.get_mut(request_id) else {
-            return Ok(None);
-        };
-        let Some(question) = pending.request.questions.get(question_index) else {
-            return Err(AppError::Channel(
-                "telegram callback question index invalid".to_string(),
-            ));
-        };
-        let Some(option) = question.options.get(option_index) else {
-            return Err(AppError::Channel(
-                "telegram callback option index invalid".to_string(),
-            ));
-        };
-        pending
-            .answers
-            .insert(question.id.clone(), vec![option.label.clone()]);
-        if pending.answers.len() < pending.request.questions.len() {
-            return Ok(None);
-        }
-        let response = UserInputResponse {
-            answers: pending.answers.clone(),
-        };
-        if let Some(sender) = pending.sender.take() {
-            let _ = sender.send(response.clone());
-        }
-        self.requests.remove(request_id);
-        Ok(Some(response))
-    }
-
-    /// 自动选择推荐项，适用于非阻塞用户输入超时。
-    fn auto_resolve(&mut self, request_id: &str) -> AppResult<UserInputResponse> {
-        let Some(pending) = self.requests.remove(request_id) else {
-            return Err(AppError::Channel(
-                "telegram user input request missing".to_string(),
-            ));
-        };
-        let mut answers = pending.answers;
-        for question in pending.request.questions {
-            answers.entry(question.id).or_insert_with(|| {
-                question
-                    .options
-                    .first()
-                    .map(|option| vec![option.label.clone()])
-                    .unwrap_or_default()
-            });
-        }
-        Ok(UserInputResponse { answers })
-    }
-}
-
-impl TelegramPendingUserInput {
-    /// 估算单个等待输入项容量。
-    fn resource_bytes(&self) -> usize {
-        estimate_user_input_request_bytes(&self.request) + estimate_answers_bytes(&self.answers)
-    }
-}
-
 /// 运行 Telegram polling 主循环。
 async fn run_telegram_polling(
     api: Arc<TelegramApi>,
@@ -1140,12 +993,11 @@ async fn handle_callback_query(
         return Ok(());
     };
     if let Some((request_id, question_index, option_index)) = parse_user_input_callback(data) {
-        let response =
-            user_inputs
-                .lock()
-                .await
-                .answer_callback(request_id, question_index, option_index)?;
-        let text = if response.is_some() {
+        let finished = {
+            let mut pending = user_inputs.lock().await;
+            answer_telegram_user_input(&mut *pending, request_id, question_index, option_index)?
+        };
+        let text = if finished == Some(true) {
             "已选择"
         } else {
             "已记录"
@@ -1162,6 +1014,38 @@ async fn handle_callback_query(
         data
     );
     Ok(())
+}
+
+/// 记录 Telegram 按钮答案，适用于 callback 索引映射，例如 `req-42 + 0 + 1 -> finished`。
+fn answer_telegram_user_input(
+    pending: &mut TelegramPendingUserInputs,
+    request_id: &str,
+    question_index: usize,
+    option_index: usize,
+) -> AppResult<Option<bool>> {
+    let Some(view) = pending.view(request_id) else {
+        return Ok(None);
+    };
+    let Some(question) = view.request.questions.get(question_index) else {
+        return Err(AppError::Channel(
+            "telegram callback question index invalid".to_string(),
+        ));
+    };
+    let Some(option) = question.options.get(option_index) else {
+        return Err(AppError::Channel(
+            "telegram callback option index invalid".to_string(),
+        ));
+    };
+    let question_id = question.id.clone();
+    let answer = option.label.clone();
+    let result = pending.answer(request_id, &question_id, answer);
+    let Some((accepted_request_id, finished)) = result.accepted() else {
+        return Ok(None);
+    };
+    if finished {
+        pending.finish(accepted_request_id);
+    }
+    Ok(Some(finished))
 }
 
 /// 将 Telegram message 转成标准入站消息。

@@ -5,11 +5,14 @@ use base64::engine::general_purpose::STANDARD;
 use reqwest::Client;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 
 use crate::config::{AppConfig, ProviderConfig};
 use crate::error::{AppError, AppResult};
 use crate::message::InboundAttachment;
+use crate::provider::StreamChunk;
 use crate::provider::limits::resolve_model_limits;
+use crate::provider::sse::SseDecoder;
 use crate::session::SessionState;
 use crate::session_store::ConversationItem;
 use crate::tools::registry::{ToolCall, ToolInput};
@@ -92,6 +95,12 @@ pub fn build_request_body(
     }
     apply_prompt_cache(&mut body);
     apply_thinking_options(&mut body, model, max_tokens, config)?;
+    if tool_specs.is_empty()
+        && let Some(object) = body.as_object_mut()
+    {
+        object.remove("tools");
+        object.remove("tool_choice");
+    }
     Ok(body)
 }
 
@@ -148,9 +157,11 @@ fn mark_system_cache(body: &mut Value, remaining: &mut usize) {
             }]);
         }
         Value::Array(parts) => {
-            let Some(part) = parts.iter_mut().rev().find(|part| {
-                part.get("type").and_then(Value::as_str) == Some("text")
-            }) else {
+            let Some(part) = parts
+                .iter_mut()
+                .rev()
+                .find(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+            else {
                 return;
             };
             mark_block_cache(part, remaining);
@@ -175,9 +186,11 @@ fn mark_latest_user_message_cache(body: &mut Value, remaining: &mut usize) {
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
-    let Some(message) = messages.iter_mut().rev().find(|message| {
-        message.get("role").and_then(Value::as_str) == Some("user")
-    }) else {
+    let Some(message) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+    else {
         return;
     };
     let Some(content) = message.get_mut("content") else {
@@ -349,6 +362,93 @@ pub async fn send_claude_request(
         )));
     }
     extract_response(&text)
+}
+
+/// 发送无工具 Claude 查询并逐段转发正文，例如 `Messages SSE -> StreamChunk::Delta`。
+pub async fn send_claude_stream_query(
+    client: &Client,
+    route: &ClaudeRoute,
+    session: &SessionState,
+    mut body: Value,
+    sender: mpsc::Sender<StreamChunk>,
+) -> AppResult<Option<u64>> {
+    body["stream"] = Value::Bool(true);
+    let url = resolve_url(route);
+    crate::log_info!(
+        "claude stream query start url={} session_id={}",
+        url,
+        session.id
+    );
+    let mut headers = build_headers(route)?;
+    headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+    let mut response = client.post(url).headers(headers).json(&body).send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await?;
+        return Err(AppError::Provider(format!(
+            "claude query failed with status {status}: {text}"
+        )));
+    }
+    let mut decoder = SseDecoder::new();
+    let mut received_text = false;
+    let mut input_tokens = 0_u64;
+    let mut output_tokens = 0_u64;
+    while let Some(chunk) = response.chunk().await? {
+        for event in decoder.push(&chunk)? {
+            let value: Value = serde_json::from_str(&event.data)?;
+            let kind = value
+                .get("type")
+                .and_then(Value::as_str)
+                .or(event.event.as_deref())
+                .unwrap_or("");
+            if kind == "message_start" {
+                input_tokens = value
+                    .get("message")
+                    .and_then(|message| message.get("usage"))
+                    .and_then(|usage| usage.get("input_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+            } else if kind == "content_block_delta"
+                && value
+                    .get("delta")
+                    .and_then(|delta| delta.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("text_delta")
+                && let Some(delta) = value
+                    .get("delta")
+                    .and_then(|delta| delta.get("text"))
+                    .and_then(Value::as_str)
+            {
+                received_text = true;
+                if sender
+                    .send(StreamChunk::Delta {
+                        text: delta.to_string(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return Ok(Some(input_tokens.saturating_add(output_tokens)));
+                }
+            } else if kind == "message_delta" {
+                output_tokens = value
+                    .get("usage")
+                    .and_then(|usage| usage.get("output_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(output_tokens);
+            } else if kind == "error" {
+                return Err(AppError::Provider(format!(
+                    "claude query stream failed: {}",
+                    log_preview(&event.data, 512)
+                )));
+            }
+        }
+    }
+    if !received_text {
+        return Err(AppError::Provider(
+            "claude query stream contained no text".to_string(),
+        ));
+    }
+    Ok(Some(input_tokens.saturating_add(output_tokens)))
 }
 
 /// 解析 Claude JSON 响应。

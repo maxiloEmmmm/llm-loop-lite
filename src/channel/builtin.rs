@@ -3,6 +3,7 @@ use tokio::sync::mpsc;
 use crate::channel::feishu::{FeishuChannel, FeishuChannelHandle};
 use crate::channel::qq::{QqChannel, QqChannelHandle};
 use crate::channel::telegram::{TelegramChannel, TelegramChannelHandle};
+use crate::channel::web::{WebChannel, WebChannelHandle};
 use crate::channel::{Channel, ChannelAckCapability, ChannelAckKind, ChannelCapabilities};
 use crate::config::ChannelConfig;
 use crate::error::{AppError, AppResult};
@@ -11,6 +12,7 @@ use crate::message::{
     InboundMessage, MessageSource, MessageUpdate, OutboundMessage, SendResult, UserInputRequest,
     UserInputResponse,
 };
+use crate::query::QueryService;
 use crate::resource::ResourceUsage;
 use crate::tools::registry::ToolChannel;
 
@@ -22,6 +24,8 @@ pub enum BuiltinChannel {
     Qq(QqChannel),
     /// Telegram Bot API channel。
     Telegram(TelegramChannel),
+    /// 浏览器 WebSocket channel。
+    Web(WebChannel),
 }
 
 /// 内置 channel 的轻量工具句柄。
@@ -33,6 +37,8 @@ pub enum BuiltinChannelHandle {
     Qq(QqChannelHandle),
     /// Telegram Bot API 发送句柄。
     Telegram(TelegramChannelHandle),
+    /// 浏览器 WebSocket 发送句柄。
+    Web(WebChannelHandle),
 }
 
 impl Channel for BuiltinChannel {
@@ -42,6 +48,7 @@ impl Channel for BuiltinChannel {
             Self::Feishu(channel) => channel.name(),
             Self::Qq(channel) => channel.name(),
             Self::Telegram(channel) => channel.name(),
+            Self::Web(channel) => channel.name(),
         }
     }
 
@@ -51,6 +58,7 @@ impl Channel for BuiltinChannel {
             Self::Feishu(channel) => channel.start(tx, paths).await,
             Self::Qq(channel) => channel.start(tx, paths).await,
             Self::Telegram(channel) => channel.start(tx, paths).await,
+            Self::Web(channel) => channel.start(tx, paths).await,
         }
     }
 
@@ -60,6 +68,7 @@ impl Channel for BuiltinChannel {
             Self::Feishu(channel) => channel.stop().await,
             Self::Qq(channel) => channel.stop().await,
             Self::Telegram(channel) => channel.stop().await,
+            Self::Web(channel) => channel.stop().await,
         }
     }
 
@@ -69,6 +78,7 @@ impl Channel for BuiltinChannel {
             Self::Feishu(channel) => channel.send(message).await,
             Self::Qq(channel) => channel.send(message).await,
             Self::Telegram(channel) => channel.send(message).await,
+            Self::Web(channel) => channel.send(message).await,
         }
     }
 
@@ -78,6 +88,7 @@ impl Channel for BuiltinChannel {
             Self::Feishu(channel) => channel.update_message(message).await,
             Self::Qq(channel) => channel.update_message(message).await,
             Self::Telegram(channel) => channel.update_message(message).await,
+            Self::Web(channel) => channel.update_message(message).await,
         }
     }
 
@@ -87,6 +98,7 @@ impl Channel for BuiltinChannel {
             Self::Feishu(channel) => channel.ack_capability(kind),
             Self::Qq(channel) => channel.ack_capability(kind),
             Self::Telegram(channel) => channel.ack_capability(kind),
+            Self::Web(channel) => channel.ack_capability(kind),
         }
     }
 
@@ -96,6 +108,7 @@ impl Channel for BuiltinChannel {
             Self::Feishu(channel) => channel.capabilities(),
             Self::Qq(channel) => channel.capabilities(),
             Self::Telegram(channel) => channel.capabilities(),
+            Self::Web(channel) => channel.capabilities(),
         }
     }
 
@@ -105,6 +118,7 @@ impl Channel for BuiltinChannel {
             Self::Feishu(channel) => channel.acknowledge(message, kind).await,
             Self::Qq(channel) => channel.acknowledge(message, kind).await,
             Self::Telegram(channel) => channel.acknowledge(message, kind).await,
+            Self::Web(channel) => channel.acknowledge(message, kind).await,
         }
     }
 
@@ -118,6 +132,7 @@ impl Channel for BuiltinChannel {
             Self::Feishu(channel) => channel.request_user_input(source, request).await,
             Self::Qq(channel) => channel.request_user_input(source, request).await,
             Self::Telegram(channel) => channel.request_user_input(source, request).await,
+            Self::Web(channel) => channel.request_user_input(source, request).await,
         }
     }
 }
@@ -129,6 +144,7 @@ impl BuiltinChannelHandle {
             Self::Feishu(channel) => channel.name(),
             Self::Qq(channel) => channel.name(),
             Self::Telegram(channel) => channel.name(),
+            Self::Web(channel) => channel.name(),
         }
     }
 
@@ -138,6 +154,7 @@ impl BuiltinChannelHandle {
             Self::Feishu(channel) => channel.platform_name(),
             Self::Qq(channel) => channel.platform_name(),
             Self::Telegram(channel) => channel.platform_name(),
+            Self::Web(channel) => channel.platform_name(),
         }
     }
 
@@ -147,6 +164,7 @@ impl BuiltinChannelHandle {
             Self::Feishu(channel) => channel.ack_capability(kind),
             Self::Qq(channel) => channel.ack_capability(kind),
             Self::Telegram(channel) => channel.ack_capability(kind),
+            Self::Web(channel) => channel.ack_capability(kind),
         }
     }
 
@@ -156,6 +174,7 @@ impl BuiltinChannelHandle {
             Self::Feishu(channel) => channel.capabilities(),
             Self::Qq(channel) => channel.capabilities(),
             Self::Telegram(channel) => channel.capabilities(),
+            Self::Web(channel) => channel.capabilities(),
         }
     }
 
@@ -165,6 +184,7 @@ impl BuiltinChannelHandle {
             Self::Feishu(channel) => channel.resource_usage().await,
             Self::Qq(channel) => channel.resource_usage().await,
             Self::Telegram(channel) => channel.resource_usage().await,
+            Self::Web(channel) => channel.resource_usage().await,
         }
     }
 
@@ -178,6 +198,7 @@ impl BuiltinChannelHandle {
             Self::Feishu(channel) => channel.acknowledge(message, kind).await,
             Self::Qq(channel) => channel.acknowledge(message, kind).await,
             Self::Telegram(channel) => channel.acknowledge(message, kind).await,
+            Self::Web(channel) => channel.acknowledge(message, kind).await,
         }
     }
 }
@@ -190,6 +211,7 @@ impl ToolChannel for BuiltinChannelHandle {
             Self::Feishu(channel) => channel.send(message).await,
             Self::Qq(channel) => channel.send(message).await,
             Self::Telegram(channel) => channel.send(message).await,
+            Self::Web(channel) => channel.send(message).await,
         }
     }
 
@@ -199,6 +221,7 @@ impl ToolChannel for BuiltinChannelHandle {
             Self::Feishu(channel) => channel.update_message(message).await,
             Self::Qq(channel) => channel.update_message(message).await,
             Self::Telegram(channel) => channel.update_message(message).await,
+            Self::Web(channel) => channel.update_message(message).await,
         }
     }
 
@@ -212,6 +235,7 @@ impl ToolChannel for BuiltinChannelHandle {
             Self::Feishu(channel) => channel.request_user_input(source, request).await,
             Self::Qq(channel) => channel.request_user_input(source, request).await,
             Self::Telegram(channel) => channel.request_user_input(source, request).await,
+            Self::Web(channel) => channel.request_user_input(source, request).await,
         }
     }
 }
@@ -223,26 +247,34 @@ impl BuiltinChannel {
             Self::Feishu(channel) => BuiltinChannelHandle::Feishu(channel.tool_handle()),
             Self::Qq(channel) => BuiltinChannelHandle::Qq(channel.tool_handle()),
             Self::Telegram(channel) => BuiltinChannelHandle::Telegram(channel.tool_handle()),
+            Self::Web(channel) => BuiltinChannelHandle::Web(channel.tool_handle()),
         }
     }
 }
 
 /// 从配置构造内置 channel 列表。
-pub fn build_channels(configs: &[ChannelConfig]) -> AppResult<Vec<BuiltinChannel>> {
+pub fn build_channels(
+    configs: &[ChannelConfig],
+    query_service: QueryService,
+) -> AppResult<Vec<BuiltinChannel>> {
     let mut channels = Vec::new();
     for config in configs.iter().filter(|config| config.enabled) {
         match config.kind.as_str() {
             "feishu" | "lark" => {
                 channels.push(BuiltinChannel::Feishu(FeishuChannel::from_config(config)?));
             }
-            "qq" | "qqbot" => {
+            "qq" => {
                 channels.push(BuiltinChannel::Qq(QqChannel::from_config(config)?));
             }
-            "telegram" | "tg" => {
+            "telegram" => {
                 channels.push(BuiltinChannel::Telegram(TelegramChannel::from_config(
                     config,
                 )?));
             }
+            "web" => channels.push(BuiltinChannel::Web(WebChannel::from_config(
+                config,
+                query_service.clone(),
+            )?)),
             other => return Err(AppError::UnsupportedChannel(other.to_string())),
         }
     }

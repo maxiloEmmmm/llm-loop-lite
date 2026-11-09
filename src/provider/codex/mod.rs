@@ -21,6 +21,7 @@ use crate::tools::spec::{ToolSpec, create_image_generation_tool};
 use auth::ProviderRoute;
 use client::{
     build_compact_request_body, build_request_body, extract_response_from_sse, send_codex_request,
+    send_codex_stream_query,
 };
 use telemetry::CodexRequestMetadata;
 
@@ -210,6 +211,29 @@ impl Provider for CodexProvider {
             summary: response.text,
             total_tokens: response.total_tokens,
         })
+    }
+
+    /// 执行无工具 Codex 查询并直接转发上游文本增量，例如 `input -> deltas`。
+    async fn stream_query(
+        &self,
+        session: &SessionState,
+        history: &[ConversationItem],
+        user_input: &str,
+        sender: tokio::sync::mpsc::Sender<crate::provider::StreamChunk>,
+    ) -> AppResult<Option<u64>> {
+        let route = ProviderRoute::resolve(&self.config, &self.paths)?;
+        let metadata = CodexRequestMetadata::for_turn(&self.paths, session).await?;
+        let body = build_request_body(
+            &self.config.provider,
+            session,
+            history,
+            user_input,
+            &[],
+            &metadata,
+            &[],
+            &[],
+        )?;
+        send_codex_stream_query(&self.client, &route, session, &metadata, body, sender).await
     }
 }
 

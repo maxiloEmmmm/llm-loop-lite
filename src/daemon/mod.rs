@@ -24,6 +24,7 @@ use crate::message::{
     UserInputRequest, UserInputResponse, outbound_target_from_source,
 };
 use crate::provider::{BuiltinProvider, Provider, build_provider};
+use crate::query::QueryService;
 use crate::scheduler::{SchedulerChannel, run_cron_scheduler};
 use crate::session::{SessionRegistry, build_message_key};
 use crate::session_store;
@@ -160,7 +161,10 @@ impl Daemon {
         install_builtin_skills(&self.paths).await?;
         spawn_store_cleaner(self.paths.channel_store_dir.clone());
         let (tx, mut rx) = mpsc::channel::<InboundMessage>(128);
-        let mut channels = build_channels(&self.config.channels)?;
+        let mut channels = build_channels(
+            &self.config.channels,
+            QueryService::new(self.provider.clone()),
+        )?;
 
         for channel in &mut channels {
             channel.start(tx.clone(), &self.paths).await?;

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -21,7 +21,11 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use crate::channel::attachments::{
     DownloadedAttachment, sanitize_filename, store_inbound_attachment,
 };
-use crate::channel::{Channel, ChannelAckCapability, ChannelAckKind, ChannelCapabilities};
+use crate::channel::cache::BoundedIdCache;
+use crate::channel::user_input::{PendingInputMetadata, PendingUserInputs, wait_for_user_input};
+use crate::channel::{
+    Channel, ChannelAckCapability, ChannelAckKind, ChannelCapabilities, resolve_channel_secret,
+};
 use crate::config::{ChannelConfig, FeishuChannelConfig};
 use crate::error::{AppError, AppResult};
 use crate::home::AppPaths;
@@ -29,10 +33,7 @@ use crate::message::{
     InboundAttachment, InboundMessage, MessageSource, MessageUpdate, OutboundMessage,
     OutboundRecipient, SendResult, UserInputRequest, UserInputResponse,
 };
-use crate::resource::{
-    ResourceUsage, estimate_answers_bytes, estimate_message_source_bytes,
-    estimate_user_input_request_bytes,
-};
+use crate::resource::{ResourceUsage, estimate_message_source_bytes};
 
 use api::{FeishuApi, FeishuMessageDetail, FeishuReceiveIdType, FeishuRecipient};
 use event::{FeishuEventEnvelope, FeishuReceiveMessageEvent};
@@ -58,13 +59,13 @@ pub struct FeishuChannel {
     /// 群聊是否要求 @ 机器人。
     require_mention: bool,
     /// 消息去重状态。
-    seen: Arc<Mutex<DedupCache>>,
+    seen: Arc<Mutex<BoundedIdCache>>,
     /// 需要以飞书子话题回复的入站消息 id。
     thread_replies: Arc<Mutex<ThreadReplyCache>>,
     /// WebSocket ping 间隔。
     ping_interval: Duration,
     /// 等待飞书卡片按钮回调的用户输入请求。
-    user_inputs: Arc<Mutex<PendingUserInputs>>,
+    user_inputs: Arc<Mutex<FeishuPendingUserInputs>>,
     /// 后台长连接任务。
     task: Option<JoinHandle<()>>,
 }
@@ -77,11 +78,11 @@ pub struct FeishuChannelHandle {
     /// 飞书 REST API。
     api: Arc<FeishuApi>,
     /// 消息去重状态。
-    seen: Arc<Mutex<DedupCache>>,
+    seen: Arc<Mutex<BoundedIdCache>>,
     /// 需要以飞书子话题回复的入站消息 id。
     thread_replies: Arc<Mutex<ThreadReplyCache>>,
     /// 等待飞书卡片按钮回调的用户输入请求。
-    user_inputs: Arc<Mutex<PendingUserInputs>>,
+    user_inputs: Arc<Mutex<FeishuPendingUserInputs>>,
 }
 
 impl FeishuChannel {
@@ -97,12 +98,14 @@ impl FeishuChannel {
             )),
             bot_name: config.feishu.bot_name.clone(),
             require_mention: config.feishu.require_mention,
-            seen: Arc::new(Mutex::new(DedupCache::new(config.feishu.dedup_cache_size))),
+            seen: Arc::new(Mutex::new(BoundedIdCache::new(
+                config.feishu.dedup_cache_size.max(32),
+            ))),
             thread_replies: Arc::new(Mutex::new(ThreadReplyCache::new(
                 config.feishu.dedup_cache_size,
             ))),
             ping_interval: Duration::from_secs(config.feishu.ping_interval_seconds.max(1)),
-            user_inputs: Arc::new(Mutex::new(PendingUserInputs::default())),
+            user_inputs: Arc::new(Mutex::new(PendingUserInputs::new())),
             task: None,
         })
     }
@@ -125,9 +128,9 @@ impl FeishuChannel {
         tx: mpsc::Sender<InboundMessage>,
         name: String,
         gate: MentionGate,
-        seen: Arc<Mutex<DedupCache>>,
+        seen: Arc<Mutex<BoundedIdCache>>,
         thread_replies: Arc<Mutex<ThreadReplyCache>>,
-        user_inputs: Arc<Mutex<PendingUserInputs>>,
+        user_inputs: Arc<Mutex<FeishuPendingUserInputs>>,
         store_root: PathBuf,
     ) -> AppResult<Option<FeishuFrame>> {
         let header_type = header_value(&frame.headers, HEADER_TYPE);
@@ -167,14 +170,20 @@ impl FeishuChannel {
                 && !message.is_stop_command()
                 && !message.is_status_command()
             {
-                user_inputs
-                    .lock()
-                    .await
-                    .answer_next_by_source(&message.source, message.text.clone())
+                let mut pending = user_inputs.lock().await;
+                let result = pending.answer_next_where(
+                    |metadata| same_user_input_source(&metadata.source, &message.source),
+                    message.text.clone(),
+                );
+                result.accepted().map(|(request_id, finished)| {
+                    let update = build_pending_user_input_update(&pending, request_id, finished);
+                    let completed = !finished || pending.finish(request_id);
+                    (update, finished, completed)
+                })
             } else {
-                UserInputAnswerResult::Missing
+                None
             };
-            if let UserInputAnswerResult::Accepted { update, finished } = user_input_result {
+            if let Some((update, finished, completed)) = user_input_result {
                 if let Some(update) = update
                     && let Err(err) = api
                         .patch_interactive_card(&update.message_id, update.card)
@@ -183,6 +192,7 @@ impl FeishuChannel {
                     crate::log_info!("feishu user input card patch failed: {err}");
                 }
                 if finished
+                    && completed
                     && let Some(message_id) = message.message_id.as_deref()
                     && let Err(err) = api.add_done_reaction(message_id).await
                 {
@@ -334,13 +344,15 @@ impl FeishuChannelHandle {
         source: &MessageSource,
         request: UserInputRequest,
     ) -> AppResult<UserInputResponse> {
-        let request_id = uuid::Uuid::new_v4().simple().to_string();
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut pending = self.user_inputs.lock().await;
-            pending.insert(request_id.clone(), request.clone(), tx);
-            pending.bind_source(&request_id, source.clone());
-        }
+        let timeout_ms = request.auto_resolution_ms;
+        let waiter = self.user_inputs.lock().await.start(
+            request.clone(),
+            FeishuPendingMetadata {
+                source: source.clone(),
+                card_message_id: None,
+            },
+        );
+        let request_id = waiter.request_id().to_string();
         let card = build_user_input_card(&request_id, &request);
         match self
             .api
@@ -349,10 +361,10 @@ impl FeishuChannelHandle {
         {
             Ok(message_id) => {
                 if let Some(message_id) = &message_id {
-                    self.user_inputs
-                        .lock()
-                        .await
-                        .bind_card_message(&request_id, message_id.clone());
+                    if let Some(metadata) = self.user_inputs.lock().await.metadata_mut(&request_id)
+                    {
+                        metadata.card_message_id = Some(message_id.clone());
+                    }
                 }
                 crate::log_info!(
                     "feishu user input card sent request_id={} message_id={}",
@@ -365,21 +377,7 @@ impl FeishuChannelHandle {
                 return Err(err);
             }
         }
-        let output = if let Some(timeout_ms) = request.auto_resolution_ms {
-            match tokio::time::timeout(Duration::from_millis(timeout_ms), rx).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(_)) => {
-                    return Err(AppError::Channel(
-                        "feishu user input waiter was closed".to_string(),
-                    ));
-                }
-                Err(_) => self.user_inputs.lock().await.auto_resolve(&request_id)?,
-            }
-        } else {
-            rx.await
-                .map_err(|_| AppError::Channel("feishu user input waiter was closed".to_string()))?
-        };
-        Ok(output)
+        wait_for_user_input(&self.user_inputs, waiter, timeout_ms, "feishu").await
     }
 
     /// 给入站消息添加处理中 reaction。
@@ -1064,9 +1062,9 @@ struct ResolvedFeishuConfig {
 impl ResolvedFeishuConfig {
     /// 解析飞书配置，适用于 channel 启动前检查凭据。
     fn resolve(config: &FeishuChannelConfig) -> AppResult<Self> {
-        let app_id = resolve_secret(config.app_id.as_deref(), config.app_id_env.as_deref())
+        let app_id = resolve_channel_secret(config.app_id.as_deref(), config.app_id_env.as_deref())
             .ok_or_else(|| AppError::Channel("feishu app_id is required".to_string()))?;
-        let app_secret = resolve_secret(
+        let app_secret = resolve_channel_secret(
             config.app_secret.as_deref(),
             config.app_secret_env.as_deref(),
         )
@@ -1156,14 +1154,6 @@ struct MentionGate {
     bot_name: Option<String>,
 }
 
-/// 消息去重缓存。
-struct DedupCache {
-    /// 最大缓存数量。
-    capacity: usize,
-    /// 最近消息 id。
-    order: VecDeque<String>,
-}
-
 /// 飞书子话题回复缓存。
 struct ThreadReplyCache {
     /// 最大缓存数量。
@@ -1174,39 +1164,28 @@ struct ThreadReplyCache {
     ids: HashSet<String>,
 }
 
-/// 等待中的飞书用户输入请求集合。
-#[derive(Default)]
-struct PendingUserInputs {
-    /// 按请求 id 保存等待状态。
-    items: HashMap<String, PendingUserInput>,
-}
-
-/// 单个飞书用户输入等待状态。
-struct PendingUserInput {
+/// 飞书等待输入的附加状态，适用于文本兜底和卡片更新，例如 `source + message_id`。
+struct FeishuPendingMetadata {
     /// 触发请求的来源。
-    source: Option<MessageSource>,
-    /// 原始请求，用于超时自动选择。
-    request: UserInputRequest,
-    /// 已收集答案。
-    answers: HashMap<String, Vec<String>>,
-    /// 完成时唤醒 tool。
-    sender: Option<oneshot::Sender<UserInputResponse>>,
+    source: MessageSource,
     /// 飞书卡片消息 id，用于原地更新。
     card_message_id: Option<String>,
 }
 
-/// 用户输入推进结果。
-enum UserInputAnswerResult {
-    /// 没有匹配的等待项。
-    Missing,
-    /// 已接收答案，可选继续发送下一题。
-    Accepted {
-        /// 卡片更新请求；为空表示无法原地更新。
-        update: Option<UserInputMessageUpdate>,
-        /// 是否已经收齐所有问题。
-        finished: bool,
-    },
+impl PendingInputMetadata for FeishuPendingMetadata {
+    /// 返回飞书附加状态占用，适用于资源统计，例如 `source + card id -> bytes`。
+    fn resource_bytes(&self) -> usize {
+        estimate_message_source_bytes(&self.source)
+            + self
+                .card_message_id
+                .as_ref()
+                .map(String::capacity)
+                .unwrap_or(0)
+    }
 }
+
+/// 飞书等待输入集合，适用于卡片和同来源文本回答，例如 `request -> response`。
+type FeishuPendingUserInputs = PendingUserInputs<FeishuPendingMetadata>;
 
 /// 用户输入消息更新请求。
 struct UserInputMessageUpdate {
@@ -1214,177 +1193,6 @@ struct UserInputMessageUpdate {
     message_id: String,
     /// 更新后的卡片 JSON。
     card: serde_json::Value,
-}
-
-impl PendingUserInputs {
-    /// 插入新的等待项，适用于发送卡片前登记回调。
-    fn insert(
-        &mut self,
-        request_id: String,
-        request: UserInputRequest,
-        sender: oneshot::Sender<UserInputResponse>,
-    ) {
-        self.items.insert(
-            request_id,
-            PendingUserInput {
-                source: None,
-                request,
-                answers: HashMap::new(),
-                sender: Some(sender),
-                card_message_id: None,
-            },
-        );
-    }
-
-    /// 移除等待项，适用于发送卡片失败或 reset 清理。
-    fn remove(&mut self, request_id: &str) {
-        self.items.remove(request_id);
-    }
-
-    /// 记录一次按钮选择，适用于原地更新飞书卡片。
-    fn answer(
-        &mut self,
-        request_id: &str,
-        question_id: &str,
-        value: String,
-    ) -> UserInputAnswerResult {
-        let Some(pending) = self.items.get_mut(request_id) else {
-            return UserInputAnswerResult::Missing;
-        };
-        pending.answers.insert(question_id.to_string(), vec![value]);
-        let finished = !has_unanswered_question(pending);
-        let update = pending
-            .card_message_id
-            .as_ref()
-            .map(|message_id| UserInputMessageUpdate {
-                message_id: message_id.clone(),
-                card: build_user_input_status_card(
-                    request_id,
-                    &pending.request,
-                    &pending.answers,
-                    finished,
-                ),
-            });
-        if !finished {
-            return UserInputAnswerResult::Accepted {
-                update,
-                finished: false,
-            };
-        }
-        let Some(mut pending) = self.items.remove(request_id) else {
-            return UserInputAnswerResult::Missing;
-        };
-        if let Some(sender) = pending.sender.take() {
-            let _ = sender.send(UserInputResponse {
-                answers: pending.answers,
-            });
-        }
-        UserInputAnswerResult::Accepted {
-            update,
-            finished: true,
-        }
-    }
-
-    /// 绑定请求来源，适用于普通文本作为自定义答案。
-    fn bind_source(&mut self, request_id: &str, source: MessageSource) {
-        if let Some(pending) = self.items.get_mut(request_id) {
-            pending.source = Some(source);
-        }
-    }
-
-    /// 绑定飞书卡片消息 id，适用于后续原地更新。
-    fn bind_card_message(&mut self, request_id: &str, message_id: String) {
-        if let Some(pending) = self.items.get_mut(request_id) {
-            pending.card_message_id = Some(message_id);
-        }
-    }
-
-    /// 将普通文本填入同来源的下一个未回答问题。
-    fn answer_next_by_source(
-        &mut self,
-        source: &MessageSource,
-        value: String,
-    ) -> UserInputAnswerResult {
-        let Some(request_id) = self.items.iter().find_map(|(request_id, pending)| {
-            pending
-                .source
-                .as_ref()
-                .is_some_and(|pending_source| same_user_input_source(pending_source, source))
-                .then(|| request_id.clone())
-        }) else {
-            return UserInputAnswerResult::Missing;
-        };
-        let Some(question_id) = self
-            .items
-            .get(&request_id)
-            .and_then(next_unanswered_question_id)
-        else {
-            return UserInputAnswerResult::Missing;
-        };
-        self.answer(&request_id, &question_id, value)
-    }
-
-    /// 超时后选择每题第一个选项，适用于模型允许自动决策时继续执行。
-    fn auto_resolve(&mut self, request_id: &str) -> AppResult<UserInputResponse> {
-        let Some(pending) = self.items.remove(request_id) else {
-            return Err(AppError::Channel(
-                "feishu user input request is missing".to_string(),
-            ));
-        };
-        let mut answers = pending.answers;
-        for question in pending.request.questions {
-            answers.entry(question.id).or_insert_with(|| {
-                question
-                    .options
-                    .first()
-                    .map(|option| vec![option.label.clone()])
-                    .unwrap_or_default()
-            });
-        }
-        Ok(UserInputResponse { answers })
-    }
-
-    /// 清空所有等待项，适用于 reset 或 channel 停止释放内存。
-    fn clear(&mut self) {
-        self.items.clear();
-    }
-
-    /// 返回等待输入集合资源估算。
-    fn resource_usage(&self, name: &str) -> ResourceUsage {
-        let body_bytes = self
-            .items
-            .iter()
-            .map(|(key, pending)| key.capacity().saturating_add(pending.resource_bytes()))
-            .sum::<usize>();
-        let entry_bytes = self
-            .items
-            .capacity()
-            .saturating_mul(std::mem::size_of::<(String, PendingUserInput)>());
-        ResourceUsage::new(
-            name,
-            "hashmap",
-            self.items.len(),
-            Some(self.items.capacity()),
-            entry_bytes.saturating_add(body_bytes),
-        )
-    }
-}
-
-impl PendingUserInput {
-    /// 估算单个等待输入项容量。
-    fn resource_bytes(&self) -> usize {
-        self.source
-            .as_ref()
-            .map(estimate_message_source_bytes)
-            .unwrap_or(0)
-            + estimate_user_input_request_bytes(&self.request)
-            + estimate_answers_bytes(&self.answers)
-            + self
-                .card_message_id
-                .as_ref()
-                .map(String::capacity)
-                .unwrap_or(0)
-    }
 }
 
 /// 构造首个飞书选择卡片，适用于 request_user_input 工具。
@@ -1522,30 +1330,25 @@ fn same_user_input_source(left: &MessageSource, right: &MessageSource) -> bool {
         && left.user_id == right.user_id
 }
 
-/// 返回下一个未回答问题 id。
-fn next_unanswered_question_id(pending: &PendingUserInput) -> Option<String> {
-    pending
-        .request
-        .questions
-        .iter()
-        .find(|question| !pending.answers.contains_key(&question.id))
-        .map(|question| question.id.clone())
-}
-
-/// 判断是否还有未回答问题，适用于多问题卡片收齐后再继续。
-fn has_unanswered_question(pending: &PendingUserInput) -> bool {
-    pending
-        .request
-        .questions
-        .iter()
-        .any(|question| !pending.answers.contains_key(&question.id))
+/// 构造等待输入卡片更新，适用于答案变化后刷新状态，例如 `req-42 + done -> card`。
+fn build_pending_user_input_update(
+    pending: &FeishuPendingUserInputs,
+    request_id: &str,
+    finished: bool,
+) -> Option<UserInputMessageUpdate> {
+    let view = pending.view(request_id)?;
+    let message_id = view.metadata.card_message_id.clone()?;
+    Some(UserInputMessageUpdate {
+        message_id,
+        card: build_user_input_status_card(request_id, view.request, view.answers, finished),
+    })
 }
 
 /// 处理飞书卡片按钮回调，适用于唤醒 request_user_input。
 async fn handle_card_action(
     event: serde_json::Value,
     api: Arc<FeishuApi>,
-    user_inputs: Arc<Mutex<PendingUserInputs>>,
+    user_inputs: Arc<Mutex<FeishuPendingUserInputs>>,
 ) {
     crate::log_info!(
         "feishu card action received payload={}",
@@ -1571,23 +1374,20 @@ async fn handle_card_action(
         crate::log_info!("feishu card action ignored reason=missing_answer");
         return;
     };
-    let result = user_inputs
-        .lock()
-        .await
-        .answer(request_id, question_id, answer.to_string());
-    let accepted = matches!(result, UserInputAnswerResult::Accepted { .. });
-    match result {
-        UserInputAnswerResult::Accepted {
-            update: Some(update),
-            finished: _,
-        } => {
-            spawn_user_input_card_patch(api, update);
+    let (accepted, update) = {
+        let mut pending = user_inputs.lock().await;
+        let result = pending.answer(request_id, question_id, answer.to_string());
+        let Some((accepted_request_id, finished)) = result.accepted() else {
+            return;
+        };
+        let update = build_pending_user_input_update(&pending, accepted_request_id, finished);
+        if finished {
+            pending.finish(accepted_request_id);
         }
-        UserInputAnswerResult::Accepted {
-            update: None,
-            finished: _,
-        } => {}
-        UserInputAnswerResult::Missing => {}
+        (true, update)
+    };
+    if let Some(update) = update {
+        spawn_user_input_card_patch(api, update);
     }
     crate::log_info!(
         "feishu card action handled request_id={} question_id={} accepted={}",
@@ -1687,52 +1487,15 @@ impl ThreadReplyCache {
     }
 }
 
-impl DedupCache {
-    /// 创建去重缓存。
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity: capacity.max(32),
-            order: VecDeque::new(),
-        }
-    }
-
-    /// 记录消息 id，返回是否已经见过。
-    fn seen_before(&mut self, message_id: &str) -> bool {
-        if self.order.iter().any(|item| item == message_id) {
-            return true;
-        }
-        self.order.push_back(message_id.to_string());
-        while self.order.len() > self.capacity {
-            self.order.pop_front();
-        }
-        false
-    }
-
-    /// 清空去重窗口，适用于 reset 后释放内存占用。
-    fn clear(&mut self) {
-        self.order.clear();
-    }
-
-    /// 返回去重缓存资源估算。
-    fn resource_usage(&self, name: &str) -> ResourceUsage {
-        let bytes = self
-            .order
-            .capacity()
-            .saturating_mul(std::mem::size_of::<String>())
-            .saturating_add(self.order.iter().map(String::capacity).sum::<usize>());
-        ResourceUsage::new(name, "cache", self.order.len(), Some(self.capacity), bytes)
-    }
-}
-
 /// 运行飞书 WebSocket 循环。
 async fn run_ws_loop(
     api: Arc<FeishuApi>,
     tx: mpsc::Sender<InboundMessage>,
     name: String,
     gate: MentionGate,
-    seen: Arc<Mutex<DedupCache>>,
+    seen: Arc<Mutex<BoundedIdCache>>,
     thread_replies: Arc<Mutex<ThreadReplyCache>>,
-    user_inputs: Arc<Mutex<PendingUserInputs>>,
+    user_inputs: Arc<Mutex<FeishuPendingUserInputs>>,
     store_root: PathBuf,
     ping_interval: Duration,
 ) -> AppResult<()> {
@@ -1794,23 +1557,11 @@ async fn run_ws_loop(
     Ok(())
 }
 
-/// 解析配置或环境变量中的密钥。
-fn resolve_secret(value: Option<&str>, env_key: Option<&str>) -> Option<String> {
-    value
-        .filter(|item| !item.trim().is_empty())
-        .map(|item| item.trim().to_string())
-        .or_else(|| {
-            env_key
-                .and_then(|key| std::env::var(key).ok())
-                .filter(|item| !item.trim().is_empty())
-        })
-}
-
 /// 判断事件是否应丢弃。
 async fn should_drop_event(
     event: &FeishuReceiveMessageEvent,
     gate: &MentionGate,
-    seen: Arc<Mutex<DedupCache>>,
+    seen: Arc<Mutex<BoundedIdCache>>,
 ) -> bool {
     crate::log_info!(
         "feishu event received message_id={} chat_type={} chat_id={} thread_id={} root_id={} parent_id={} sender_union_id={} sender_user_id={} sender_open_id={} message_type={} text={}",

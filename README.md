@@ -1,6 +1,6 @@
 # llm-loop
 
-`llm-loop` is a lightweight daemon that connects chat channels to coding-oriented LLM providers. It turns Feishu, Telegram, and QQ messages into persistent agent sessions, adds local tools and skills, manages context, and sends replies back through the original channel.
+`llm-loop` is a lightweight daemon that connects chat channels to coding-oriented LLM providers. It turns Feishu, Telegram, QQ, and browser messages into persistent agent sessions, adds local tools and skills, manages context, and sends replies back through the original channel.
 
 It is meant for people who want a small always-on bot process instead of a full agent platform. The daemon keeps the channel layer, provider layer, tools, skills, memories, and session cache in one compact Rust service.
 
@@ -22,6 +22,7 @@ It is meant for people who want a small always-on bot process instead of a full 
 | Feishu / Lark | Primary | WebSocket receive path, message/reaction acknowledgements, cards, file/image handling, and updatable plan messages. |
 | Telegram | Primary | Bot API polling, reactions/typing, reply threading, attachment download, and inline user input. |
 | QQ Bot | Basic | WebSocket receive path and passive replies; platform limitations make some interactions less rich. |
+| Web | Primary | React UI, optional token-authenticated WebSocket conversations, structured user input, and disk-served static assets. |
 
 ## Providers
 
@@ -99,7 +100,30 @@ enabled = false
 [channels.qq]
 app_id_env = "QQBOT_APP_ID"
 app_secret_env = "QQBOT_APP_SECRET"
+
+[[channels]]
+name = "web-main"
+kind = "web"
+enabled = true
+
+[channels.web]
+bind = "127.0.0.1:8787"
+static-dir = "/usr/share/llm-loop/web"
+auth-token-env = "LLM_LOOP_WEB_TOKEN"
+max-message-bytes = 65536
 ```
+
+### Web frontend
+
+The React frontend is an independent Vite project. Its output stays outside the Rust binary and can be replaced without rebuilding the daemon.
+
+```bash
+cd web
+bun install
+bun run build
+```
+
+Copy `web/dist/` to the configured `static-dir`. `src/index.jsx` only mounts the application; confirmed business pages live under `src/modules/` and are registered by `src/app/modules.js`. Shared module routing helpers live under `src/shared/`.
 
 ### Important Paths
 

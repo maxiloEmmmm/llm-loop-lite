@@ -1,6 +1,7 @@
 pub mod claude;
 pub mod codex;
 pub mod limits;
+mod sse;
 
 pub use claude::ClaudeProvider;
 pub use codex::CodexProvider;
@@ -17,7 +18,9 @@ use crate::session::SessionState;
 use crate::session_store::ConversationItem;
 use crate::tools::ToolRegistry;
 use crate::tools::registry::ToolChannel;
+use serde::Serialize;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 /// 创建配置指定的 provider，适用于 daemon 启动时固定请求后端。
 pub fn build_provider(config: AppConfig, paths: AppPaths) -> AppResult<BuiltinProvider> {
@@ -100,6 +103,28 @@ impl Provider for BuiltinProvider {
             Self::Claude(provider) => provider.compact(session, history).await,
         }
     }
+
+    /// 执行无工具独立查询并逐段发送文本，例如 `query -> delta...done`。
+    async fn stream_query(
+        &self,
+        session: &SessionState,
+        history: &[ConversationItem],
+        user_input: &str,
+        sender: mpsc::Sender<StreamChunk>,
+    ) -> AppResult<Option<u64>> {
+        match self {
+            Self::Codex(provider) => {
+                provider
+                    .stream_query(session, history, user_input, sender)
+                    .await
+            }
+            Self::Claude(provider) => {
+                provider
+                    .stream_query(session, history, user_input, sender)
+                    .await
+            }
+        }
+    }
 }
 
 /// provider 抽象，负责把 session + user input 转成模型回复。
@@ -126,6 +151,37 @@ pub trait Provider: Send + Sync {
         session: &SessionState,
         history: &[ConversationItem],
     ) -> AppResult<CompactionReply>;
+
+    /// 执行无工具独立查询并逐段发送文本，例如 `history + input -> deltas`。
+    async fn stream_query(
+        &self,
+        session: &SessionState,
+        history: &[ConversationItem],
+        user_input: &str,
+        sender: mpsc::Sender<StreamChunk>,
+    ) -> AppResult<Option<u64>>;
+}
+
+/// 独立查询流事件，直接序列化为浏览器 SSE data。
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StreamChunk {
+    /// 新增文本片段。
+    Delta {
+        /// 本次新增正文。
+        text: String,
+    },
+    /// 查询完成。
+    Done {
+        /// 上游报告的本轮总 token。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total_tokens: Option<u64>,
+    },
+    /// 查询失败。
+    Error {
+        /// 可直接展示的错误摘要。
+        message: String,
+    },
 }
 
 /// 助手回复结构，后续可扩展 tool call 和 usage。

@@ -1,18 +1,22 @@
 //! QQ 官方机器人 channel 实现。
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{Sink, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::channel::{Channel, ChannelAckCapability, ChannelAckKind, ChannelCapabilities};
+use crate::channel::cache::BoundedIdCache;
+use crate::channel::user_input::{PendingUserInputs, wait_for_user_input};
+use crate::channel::{
+    Channel, ChannelAckCapability, ChannelAckKind, ChannelCapabilities, resolve_channel_secret,
+};
 use crate::config::{ChannelConfig, QqChannelConfig};
 use crate::error::{AppError, AppResult};
 use crate::home::AppPaths;
@@ -20,7 +24,7 @@ use crate::message::{
     InboundMessage, MessageSource, MessageUpdate, OutboundMessage, OutboundRecipient, SendResult,
     UserInputRequest, UserInputResponse,
 };
-use crate::resource::{ResourceUsage, estimate_answers_bytes, estimate_user_input_request_bytes};
+use crate::resource::ResourceUsage;
 
 const OP_DISPATCH: i64 = 0;
 const OP_HEARTBEAT: i64 = 1;
@@ -33,6 +37,9 @@ const QQ_USER_PREFIX: &str = "user:";
 const QQ_GROUP_PREFIX: &str = "group:";
 const QQ_CHANNEL_PREFIX: &str = "channel:";
 
+/// QQ 等待输入集合，适用于按钮 interaction 回调，例如 `request -> response`。
+type QqPendingUserInputs = PendingUserInputs<()>;
+
 /// QQ 官方机器人 channel，负责长连接收消息和 REST 被动回复。
 pub struct QqChannel {
     /// channel 实例名。
@@ -42,7 +49,7 @@ pub struct QqChannel {
     /// WebSocket intents 位图。
     intents: u64,
     /// 消息去重状态。
-    seen: Arc<Mutex<QqDedupCache>>,
+    seen: Arc<Mutex<BoundedIdCache>>,
     /// 等待中的用户输入请求。
     user_inputs: Arc<Mutex<QqPendingUserInputs>>,
     /// 已发送消息目标缓存。
@@ -61,7 +68,7 @@ pub struct QqChannelHandle {
     /// QQ REST API。
     api: Arc<QqApi>,
     /// 消息去重状态。
-    seen: Arc<Mutex<QqDedupCache>>,
+    seen: Arc<Mutex<BoundedIdCache>>,
     /// 等待中的用户输入请求。
     user_inputs: Arc<Mutex<QqPendingUserInputs>>,
     /// 已发送消息目标缓存。
@@ -81,10 +88,10 @@ impl QqChannel {
                 settings.app_secret,
             )),
             intents: settings.intents,
-            seen: Arc::new(Mutex::new(QqDedupCache::new(
+            seen: Arc::new(Mutex::new(BoundedIdCache::new(
                 config.qq.dedup_cache_size.max(1),
             ))),
-            user_inputs: Arc::new(Mutex::new(QqPendingUserInputs::default())),
+            user_inputs: Arc::new(Mutex::new(PendingUserInputs::new())),
             sent_messages: Arc::new(Mutex::new(QqSentMessageTargets::new(
                 config.qq.dedup_cache_size.max(1),
             ))),
@@ -262,14 +269,9 @@ impl QqChannelHandle {
         source: &MessageSource,
         request: UserInputRequest,
     ) -> AppResult<UserInputResponse> {
-        let request_id = uuid::Uuid::new_v4().simple().to_string();
-        let (tx, rx) = oneshot::channel();
-        {
-            self.user_inputs
-                .lock()
-                .await
-                .insert(request_id.clone(), request.clone(), tx);
-        }
+        let timeout_ms = request.auto_resolution_ms;
+        let waiter = self.user_inputs.lock().await.start(request.clone(), ());
+        let request_id = waiter.request_id().to_string();
         if let Err(err) = self
             .api
             .send_user_input(source, &request_id, &request)
@@ -278,18 +280,7 @@ impl QqChannelHandle {
             self.user_inputs.lock().await.remove(&request_id);
             return Err(err);
         }
-        if let Some(timeout_ms) = request.auto_resolution_ms {
-            match tokio::time::timeout(Duration::from_millis(timeout_ms), rx).await {
-                Ok(Ok(response)) => Ok(response),
-                Ok(Err(_)) => Err(AppError::Channel(
-                    "qq user input waiter was closed".to_string(),
-                )),
-                Err(_) => self.user_inputs.lock().await.auto_resolve(&request_id),
-            }
-        } else {
-            rx.await
-                .map_err(|_| AppError::Channel("qq user input waiter was closed".to_string()))
-        }
+        wait_for_user_input(&self.user_inputs, waiter, timeout_ms, "qq").await
     }
 
     /// 收到入站消息后发送短确认，适用于 QQ 无通用 reaction 的场景。
@@ -717,7 +708,7 @@ async fn run_qq_ws(
     tx: mpsc::Sender<InboundMessage>,
     channel_name: String,
     intents: u64,
-    seen: Arc<Mutex<QqDedupCache>>,
+    seen: Arc<Mutex<BoundedIdCache>>,
     user_inputs: Arc<Mutex<QqPendingUserInputs>>,
 ) -> AppResult<()> {
     let gateway = api.gateway().await?;
@@ -776,7 +767,7 @@ async fn handle_qq_payload<S>(
     tx: &mpsc::Sender<InboundMessage>,
     channel_name: &str,
     intents: u64,
-    seen: &Arc<Mutex<QqDedupCache>>,
+    seen: &Arc<Mutex<BoundedIdCache>>,
     user_inputs: &Arc<Mutex<QqPendingUserInputs>>,
     heartbeat: &mut tokio::time::Interval,
     raw: &str,
@@ -877,7 +868,7 @@ async fn handle_qq_dispatch(
     api: &Arc<QqApi>,
     tx: &mpsc::Sender<InboundMessage>,
     channel_name: &str,
-    seen: &Arc<Mutex<QqDedupCache>>,
+    seen: &Arc<Mutex<BoundedIdCache>>,
     user_inputs: &Arc<Mutex<QqPendingUserInputs>>,
     payload: QqPayload,
 ) -> AppResult<()> {
@@ -1186,11 +1177,22 @@ async fn handle_qq_interaction(
         acknowledge_qq_interaction(api, &event.id, 1).await;
         return;
     }
-    let accepted = user_inputs.lock().await.answer(
-        &button_data.request_id,
-        &button_data.question_id,
-        button_data.answer.clone(),
-    );
+    let accepted = {
+        let mut pending = user_inputs.lock().await;
+        let result = pending.answer(
+            &button_data.request_id,
+            &button_data.question_id,
+            button_data.answer.clone(),
+        );
+        if let Some((request_id, finished)) = result.accepted() {
+            if finished {
+                pending.finish(request_id);
+            }
+            true
+        } else {
+            false
+        }
+    };
     acknowledge_qq_interaction(api, &event.id, if accepted { 0 } else { 3 }).await;
     crate::log_info!(
         "qq interaction handled request_id={} question_id={} accepted={}",
@@ -1279,9 +1281,9 @@ struct ResolvedQqConfig {
 impl ResolvedQqConfig {
     /// 解析 QQ 配置，适用于启动前校验凭据和地址。
     fn resolve(config: &QqChannelConfig) -> AppResult<Self> {
-        let app_id = resolve_secret(config.app_id.as_deref(), config.app_id_env.as_deref())
+        let app_id = resolve_channel_secret(config.app_id.as_deref(), config.app_id_env.as_deref())
             .ok_or_else(|| AppError::Channel("qq app_id is required".to_string()))?;
-        let app_secret = resolve_secret(
+        let app_secret = resolve_channel_secret(
             config.app_secret.as_deref(),
             config.app_secret_env.as_deref(),
         )
@@ -1293,62 +1295,6 @@ impl ResolvedQqConfig {
             app_secret,
             intents: config.intents,
         })
-    }
-}
-
-/// QQ 消息去重缓存。
-struct QqDedupCache {
-    /// 最大缓存条目数。
-    capacity: usize,
-    /// 插入顺序。
-    order: VecDeque<String>,
-    /// 已见消息 id。
-    ids: HashSet<String>,
-}
-
-impl QqDedupCache {
-    /// 创建 QQ 去重缓存。
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            order: VecDeque::new(),
-            ids: HashSet::new(),
-        }
-    }
-
-    /// 判断消息是否已处理，适用于 WebSocket 重连补发事件去重。
-    fn seen_before(&mut self, message_id: &str) -> bool {
-        if !self.ids.insert(message_id.to_string()) {
-            return true;
-        }
-        self.order.push_back(message_id.to_string());
-        while self.order.len() > self.capacity {
-            if let Some(old) = self.order.pop_front() {
-                self.ids.remove(&old);
-            }
-        }
-        false
-    }
-
-    /// 返回 QQ 去重缓存资源估算。
-    fn resource_usage(&self, name: &str) -> ResourceUsage {
-        let order_bytes = self
-            .order
-            .capacity()
-            .saturating_mul(std::mem::size_of::<String>())
-            .saturating_add(self.order.iter().map(String::capacity).sum::<usize>());
-        let id_bytes = self
-            .ids
-            .capacity()
-            .saturating_mul(std::mem::size_of::<String>())
-            .saturating_add(self.ids.iter().map(String::capacity).sum::<usize>());
-        ResourceUsage::new(
-            name,
-            "cache",
-            self.ids.len(),
-            Some(self.capacity),
-            order_bytes.saturating_add(id_bytes),
-        )
     }
 }
 
@@ -1458,128 +1404,6 @@ impl QqSentMessageTargets {
             order_bytes.saturating_add(target_bytes),
         )
     }
-}
-
-/// 等待中的 QQ 用户输入请求集合。
-#[derive(Default)]
-struct QqPendingUserInputs {
-    /// 按请求 id 保存等待状态。
-    items: HashMap<String, QqPendingUserInput>,
-}
-
-/// 单个 QQ 用户输入等待状态。
-struct QqPendingUserInput {
-    /// 原始请求，用于超时自动选择。
-    request: UserInputRequest,
-    /// 已收集答案。
-    answers: HashMap<String, Vec<String>>,
-    /// 完成时唤醒 tool。
-    sender: Option<oneshot::Sender<UserInputResponse>>,
-}
-
-impl QqPendingUserInputs {
-    /// 插入新的等待项，适用于发送按钮前登记回调。
-    fn insert(
-        &mut self,
-        request_id: String,
-        request: UserInputRequest,
-        sender: oneshot::Sender<UserInputResponse>,
-    ) {
-        self.items.insert(
-            request_id,
-            QqPendingUserInput {
-                request,
-                answers: HashMap::new(),
-                sender: Some(sender),
-            },
-        );
-    }
-
-    /// 移除等待项，适用于发送失败后清理。
-    fn remove(&mut self, request_id: &str) {
-        self.items.remove(request_id);
-    }
-
-    /// 记录按钮选择，返回是否接收成功。
-    fn answer(&mut self, request_id: &str, question_id: &str, value: String) -> bool {
-        let Some(pending) = self.items.get_mut(request_id) else {
-            return false;
-        };
-        pending.answers.insert(question_id.to_string(), vec![value]);
-        if has_qq_unanswered_question(pending) {
-            return true;
-        }
-        let Some(mut pending) = self.items.remove(request_id) else {
-            return false;
-        };
-        if let Some(sender) = pending.sender.take() {
-            let _ = sender.send(UserInputResponse {
-                answers: pending.answers,
-            });
-        }
-        true
-    }
-
-    /// 超时后选择每题第一个选项，适用于模型允许自动决策时继续执行。
-    fn auto_resolve(&mut self, request_id: &str) -> AppResult<UserInputResponse> {
-        let Some(pending) = self.items.remove(request_id) else {
-            return Err(AppError::Channel(
-                "qq user input request is missing".to_string(),
-            ));
-        };
-        let mut answers = pending.answers;
-        for question in pending.request.questions {
-            answers.entry(question.id).or_insert_with(|| {
-                question
-                    .options
-                    .first()
-                    .map(|option| vec![option.label.clone()])
-                    .unwrap_or_default()
-            });
-        }
-        Ok(UserInputResponse { answers })
-    }
-
-    /// 清空所有等待项，适用于 channel 停止释放内存。
-    fn clear(&mut self) {
-        self.items.clear();
-    }
-
-    /// 返回等待输入集合资源估算。
-    fn resource_usage(&self, name: &str) -> ResourceUsage {
-        let body_bytes = self
-            .items
-            .iter()
-            .map(|(key, pending)| key.capacity().saturating_add(pending.resource_bytes()))
-            .sum::<usize>();
-        let entry_bytes = self
-            .items
-            .capacity()
-            .saturating_mul(std::mem::size_of::<(String, QqPendingUserInput)>());
-        ResourceUsage::new(
-            name,
-            "hashmap",
-            self.items.len(),
-            Some(self.items.capacity()),
-            entry_bytes.saturating_add(body_bytes),
-        )
-    }
-}
-
-impl QqPendingUserInput {
-    /// 估算单个等待输入项容量。
-    fn resource_bytes(&self) -> usize {
-        estimate_user_input_request_bytes(&self.request) + estimate_answers_bytes(&self.answers)
-    }
-}
-
-/// 判断 QQ 用户输入是否还有未回答问题。
-fn has_qq_unanswered_question(pending: &QqPendingUserInput) -> bool {
-    pending
-        .request
-        .questions
-        .iter()
-        .any(|question| !pending.answers.contains_key(&question.id))
 }
 
 /// QQ AccessToken 缓存。
@@ -1700,19 +1524,6 @@ fn parse_expires_in(value: &Value) -> Option<u64> {
     value
         .as_u64()
         .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
-}
-
-/// 解析明文或环境变量 secret。
-fn resolve_secret(value: Option<&str>, env_key: Option<&str>) -> Option<String> {
-    value
-        .map(|item| item.trim().to_string())
-        .filter(|item| !item.is_empty())
-        .or_else(|| {
-            env_key
-                .and_then(|key| std::env::var(key).ok())
-                .map(|item| item.trim().to_string())
-                .filter(|item| !item.is_empty())
-        })
 }
 
 /// 隐去 URL query，适用于日志保留路径但不泄漏参数。

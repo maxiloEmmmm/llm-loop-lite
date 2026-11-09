@@ -1,16 +1,19 @@
 use reqwest::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::Value;
+use tokio::sync::mpsc;
 
 use crate::config::ProviderConfig;
 use crate::error::{AppError, AppResult};
 use crate::message::InboundAttachment;
+use crate::provider::StreamChunk;
 use crate::provider::codex::auth::{ProviderRoute, ProviderRouteKind};
 use crate::provider::codex::telemetry::{
     CodexRequestMetadata, X_CODEX_INSTALLATION_ID_HEADER, X_CODEX_TURN_METADATA_HEADER,
     X_CODEX_WINDOW_ID_HEADER,
 };
 use crate::provider::limits::resolve_model_limits;
+use crate::provider::sse::SseDecoder;
 use crate::session::SessionState;
 use crate::session_store::ConversationItem;
 use crate::tools::spec::{ToolSpec, create_tools_json_for_responses_api};
@@ -90,6 +93,13 @@ pub fn build_request_body(
     }
     if let Some(service_tier) = service_tier_for_request(config) {
         body["service_tier"] = Value::String(service_tier);
+    }
+    if tool_specs.is_empty()
+        && let Some(object) = body.as_object_mut()
+    {
+        object.remove("tools");
+        object.remove("tool_choice");
+        object.remove("parallel_tool_calls");
     }
     Ok(body)
 }
@@ -275,6 +285,98 @@ pub async fn send_codex_request(
         )));
     }
     Ok(text)
+}
+
+/// 发送无工具 Codex 查询并逐段转发正文，例如 `Responses SSE -> StreamChunk::Delta`。
+pub async fn send_codex_stream_query(
+    client: &Client,
+    route: &ProviderRoute,
+    session: &SessionState,
+    metadata: &CodexRequestMetadata,
+    body: Value,
+    sender: mpsc::Sender<StreamChunk>,
+) -> AppResult<Option<u64>> {
+    let url = resolve_url(route);
+    let mut response = client
+        .post(url)
+        .headers(build_headers(route, session, metadata)?)
+        .json(&body)
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await?;
+        return Err(AppError::Provider(format!(
+            "codex query failed with status {status}: {text}"
+        )));
+    }
+    let mut decoder = SseDecoder::new();
+    let mut received_text = false;
+    let mut total_tokens = None;
+    while let Some(chunk) = response.chunk().await? {
+        for event in decoder.push(&chunk)? {
+            if event.data == "[DONE]" {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&event.data)?;
+            let kind = value
+                .get("type")
+                .and_then(Value::as_str)
+                .or(event.event.as_deref())
+                .unwrap_or("");
+            if matches!(
+                kind,
+                "response.output_text.delta" | "response.refusal.delta"
+            ) && let Some(delta) = value.get("delta").and_then(Value::as_str)
+            {
+                received_text = true;
+                if sender
+                    .send(StreamChunk::Delta {
+                        text: delta.to_string(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return Ok(total_tokens);
+                }
+            } else if kind.is_empty()
+                && let Some(delta) = value
+                    .get("delta")
+                    .or_else(|| value.get("text"))
+                    .and_then(Value::as_str)
+            {
+                received_text = true;
+                if sender
+                    .send(StreamChunk::Delta {
+                        text: delta.to_string(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return Ok(total_tokens);
+                }
+            }
+            if kind == "response.completed" {
+                total_tokens = value
+                    .get("response")
+                    .and_then(|response| response.get("usage"))
+                    .and_then(|usage| usage.get("total_tokens"))
+                    .and_then(Value::as_u64);
+            }
+            if matches!(kind, "response.failed" | "error") {
+                return Err(AppError::Provider(format!(
+                    "codex query stream failed: {}",
+                    log_preview(&event.data, 512)
+                )));
+            }
+        }
+    }
+    if !received_text {
+        return Err(AppError::Provider(
+            "codex query stream contained no text".to_string(),
+        ));
+    }
+    Ok(total_tokens)
 }
 
 /// 截断日志正文，适用于记录 provider 失败响应但避免日志文件暴涨。

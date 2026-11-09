@@ -200,13 +200,13 @@ fn check_channels(channels: &[ChannelConfig], checks: &mut Vec<Check>) {
                     &format!("channel.{}.app_secret", channel.name),
                 );
             }
-            "telegram" | "tg" => push_secret_check(
+            "telegram" => push_secret_check(
                 checks,
                 &channel.telegram.bot_token,
                 &channel.telegram.bot_token_env,
                 &format!("channel.{}.bot_token", channel.name),
             ),
-            "qq" | "qqbot" => {
+            "qq" => {
                 push_secret_check(
                     checks,
                     &channel.qq.app_id,
@@ -220,6 +220,7 @@ fn check_channels(channels: &[ChannelConfig], checks: &mut Vec<Check>) {
                     &format!("channel.{}.app_secret", channel.name),
                 );
             }
+            "web" => check_web_channel(channel, checks),
             other => checks.push(Check {
                 level: CheckLevel::Fail,
                 name: format!("channel.{}", channel.name),
@@ -227,6 +228,66 @@ fn check_channels(channels: &[ChannelConfig], checks: &mut Vec<Check>) {
             }),
         }
     }
+}
+
+/// 检查 Web channel 监听、静态目录和认证，例如 `LAN bind + token -> ok`。
+fn check_web_channel(channel: &ChannelConfig, checks: &mut Vec<Check>) {
+    let bind = channel.web.bind.parse::<std::net::SocketAddr>();
+    push_check(
+        checks,
+        bind.is_ok(),
+        format!("channel.{}.bind", channel.name),
+        format!("bind: {}", channel.web.bind),
+    );
+    let static_index = std::path::Path::new(&channel.web.static_dir).join("index.html");
+    push_check(
+        checks,
+        static_index.is_file(),
+        format!("channel.{}.static-dir", channel.name),
+        format!("static index: {}", static_index.display()),
+    );
+    if bind.is_ok_and(|address| !address.ip().is_loopback()) {
+        check_optional_web_auth(channel, checks);
+    }
+}
+
+/// 检查可选 Web 认证，未配置时只警告而不阻止局域网部署，例如 `LAN + no token -> warn`。
+fn check_optional_web_auth(channel: &ChannelConfig, checks: &mut Vec<Check>) {
+    let name = format!("channel.{}.auth-token", channel.name);
+    if channel
+        .web
+        .auth_token
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        checks.push(Check {
+            level: CheckLevel::Ok,
+            name,
+            message: "configured directly".to_string(),
+        });
+        return;
+    }
+    if let Some(env_name) = channel
+        .web
+        .auth_token_env
+        .as_deref()
+        .filter(|env_name| env_is_set(env_name))
+    {
+        checks.push(Check {
+            level: CheckLevel::Ok,
+            name,
+            message: format!("env {env_name} is set"),
+        });
+        return;
+    }
+    // 触发条件：端口监听在非 loopback 地址且没有连接令牌。
+    // 认证是部署策略而非服务启动前提，doctor 只提示风险。
+    // 防止回归：局域网免认证部署被错误判定为不可运行。
+    checks.push(Check {
+        level: CheckLevel::Warn,
+        name,
+        message: "authentication disabled on non-loopback bind".to_string(),
+    });
 }
 
 /// 检查明文或 env secret，适用于 channel 凭据。

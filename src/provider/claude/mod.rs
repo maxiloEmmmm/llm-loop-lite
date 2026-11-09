@@ -18,7 +18,10 @@ use crate::tools::ToolRegistry;
 use crate::tools::registry::{ToolCall, ToolChannel, ToolInput};
 use crate::tools::spec::ToolSpec;
 
-use client::{ClaudeRoute, build_compact_request_body, build_request_body, send_claude_request};
+use client::{
+    ClaudeRoute, build_compact_request_body, build_request_body, send_claude_request,
+    send_claude_stream_query,
+};
 
 #[cfg(test)]
 mod client_test;
@@ -205,6 +208,27 @@ impl Provider for ClaudeProvider {
             summary: response.text,
             total_tokens: response.total_tokens,
         })
+    }
+
+    /// 执行无工具 Claude 查询并直接转发上游文本增量，例如 `input -> deltas`。
+    async fn stream_query(
+        &self,
+        session: &SessionState,
+        history: &[ConversationItem],
+        user_input: &str,
+        sender: tokio::sync::mpsc::Sender<crate::provider::StreamChunk>,
+    ) -> AppResult<Option<u64>> {
+        let route = ClaudeRoute::resolve(&self.config)?;
+        let body = build_request_body(
+            &self.config.provider,
+            session,
+            history,
+            user_input,
+            &[],
+            &[],
+            &[],
+        )?;
+        send_claude_stream_query(&self.client, &route, session, body, sender).await
     }
 }
 

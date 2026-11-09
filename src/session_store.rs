@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 
 use crate::error::AppResult;
@@ -44,11 +43,6 @@ enum SessionStoreEvent {
         /// 回复正文。
         text: String,
     },
-    /// 旧版 provider 原始 item。
-    Raw {
-        /// 原始 item，仅用于兼容旧文件读取。
-        value: Value,
-    },
     /// token 使用量。
     TokenUsage {
         /// 本轮 total tokens。
@@ -85,7 +79,6 @@ pub async fn load_session_meta(root: &Path, session_key: &str) -> AppResult<Opti
             }
             SessionStoreEvent::User { .. }
             | SessionStoreEvent::Assistant { .. }
-            | SessionStoreEvent::Raw { .. }
             | SessionStoreEvent::Compaction { .. } => {}
             SessionStoreEvent::TokenUsage { total_tokens } => {
                 session.used_tokens = session.used_tokens.saturating_add(total_tokens);
@@ -120,9 +113,7 @@ pub async fn load_history(root: &Path, session_key: &str) -> AppResult<Vec<Conve
             SessionStoreEvent::Compaction { items: compacted } => {
                 items = compacted;
             }
-            SessionStoreEvent::Raw { .. }
-            | SessionStoreEvent::Meta { .. }
-            | SessionStoreEvent::TokenUsage { .. } => {}
+            SessionStoreEvent::Meta { .. } | SessionStoreEvent::TokenUsage { .. } => {}
         }
     }
     Ok(items)

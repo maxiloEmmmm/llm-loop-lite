@@ -24,7 +24,6 @@ pub struct AppConfig {
     /// Codex 兼容服务层级；`fast` 会在请求时转为 `priority`。
     pub service_tier: Option<String>,
     /// provider/profile 选择器，优先匹配 `model_providers.<key>`。
-    #[serde(alias = "model_provder")]
     pub model_provider: Option<String>,
     /// 日志配置。
     pub log: LogConfig,
@@ -131,6 +130,28 @@ pub struct ChannelConfig {
     pub qq: QqChannelConfig,
     /// Telegram Bot API channel 配置。
     pub telegram: TelegramChannelConfig,
+    /// Web 浏览器 channel 配置。
+    pub web: WebChannelConfig,
+}
+
+/// Web 浏览器 channel 配置，静态文件始终从磁盘读取，不嵌入二进制。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct WebChannelConfig {
+    /// HTTP 与 WebSocket 监听地址，例如 `127.0.0.1:8787`。
+    pub bind: String,
+    /// React 构建产物目录，例如 `/usr/share/llm-loop/web`。
+    #[serde(rename = "static-dir")]
+    pub static_dir: String,
+    /// 浏览器连接令牌；生产环境优先使用环境变量。
+    #[serde(rename = "auth-token")]
+    pub auth_token: Option<String>,
+    /// 浏览器连接令牌环境变量名。
+    #[serde(rename = "auth-token-env")]
+    pub auth_token_env: Option<String>,
+    /// 单条浏览器入站消息最大 UTF-8 字节数。
+    #[serde(rename = "max-message-bytes")]
+    pub max_message_bytes: usize,
 }
 
 /// 飞书 channel 配置，覆盖自建应用长连接最小闭环。
@@ -291,6 +312,20 @@ impl Default for ChannelConfig {
             feishu: FeishuChannelConfig::default(),
             qq: QqChannelConfig::default(),
             telegram: TelegramChannelConfig::default(),
+            web: WebChannelConfig::default(),
+        }
+    }
+}
+
+impl Default for WebChannelConfig {
+    /// 返回仅监听本机的 Web channel 默认值，例如 `default -> 127.0.0.1:8787`。
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:8787".to_string(),
+            static_dir: "/usr/share/llm-loop/web".to_string(),
+            auth_token: None,
+            auth_token_env: Some("LLM_LOOP_WEB_TOKEN".to_string()),
+            max_message_bytes: 64 * 1024,
         }
     }
 }

@@ -24,7 +24,6 @@ pub fn handlers() -> Vec<Arc<dyn ToolHandler>> {
     vec![
         Arc::new(shell::ExecCommandHandler),
         Arc::new(shell::WriteStdinHandler),
-        Arc::new(shell::ShellCommandHandler),
         Arc::new(patch::ApplyPatchHandler),
         Arc::new(image::ViewImageHandler),
         Arc::new(plan::UpdatePlanHandler),

@@ -96,27 +96,11 @@ struct WriteStdinArgs {
     max_output_tokens: Option<usize>,
 }
 
-/// shell_command 参数。
-#[derive(Debug, Clone, Deserialize)]
-struct ShellCommandArgs {
-    /// shell 脚本。
-    command: String,
-    /// 工作目录。
-    workdir: Option<String>,
-    /// 超时毫秒。
-    timeout_ms: Option<u64>,
-    /// 是否 login shell。
-    login: Option<bool>,
-}
-
 /// unified exec 工具。
 pub struct ExecCommandHandler;
 
 /// 写 stdin 工具。
 pub struct WriteStdinHandler;
-
-/// 旧版 shell_command 工具。
-pub struct ShellCommandHandler;
 
 #[async_trait]
 impl ToolHandler for ExecCommandHandler {
@@ -127,7 +111,7 @@ impl ToolHandler for ExecCommandHandler {
 
     /// 返回 Codex 风格 exec_command spec。
     fn spec(&self) -> ToolSpec {
-        let mut properties = BTreeMap::from([
+        let properties = BTreeMap::from([
             (
                 "cmd".to_string(),
                 JsonSchema::string(Some("Shell command to execute.".to_string())),
@@ -173,7 +157,6 @@ impl ToolHandler for ExecCommandHandler {
                 )),
             ),
         ]);
-        properties.extend(approval_compat_properties());
         ToolSpec::Function(ResponsesApiTool {
             name: self.name().to_string(),
             description:
@@ -309,89 +292,6 @@ impl ToolHandler for WriteStdinHandler {
             output_kind: ToolOutputKind::Function,
             call_id: call.call_id,
             output,
-        })
-    }
-}
-
-#[async_trait]
-impl ToolHandler for ShellCommandHandler {
-    /// 返回工具名称。
-    fn name(&self) -> &'static str {
-        "shell_command"
-    }
-
-    /// 返回 Codex 风格 shell_command spec。
-    fn spec(&self) -> ToolSpec {
-        let properties = BTreeMap::from([
-            (
-                "command".to_string(),
-                JsonSchema::string(Some(
-                    "Shell script to run in the user's default shell.".to_string(),
-                )),
-            ),
-            (
-                "workdir".to_string(),
-                JsonSchema::string(Some(
-                    "Working directory for the command. Defaults to the turn cwd.".to_string(),
-                )),
-            ),
-            (
-                "timeout_ms".to_string(),
-                JsonSchema::number(Some(
-                    "Maximum command runtime. Defaults to 10000 ms.".to_string(),
-                )),
-            ),
-            (
-                "login".to_string(),
-                JsonSchema::boolean(Some(
-                    "True runs with login shell semantics; false disables them. Defaults to true."
-                        .to_string(),
-                )),
-            ),
-        ]);
-        ToolSpec::Function(ResponsesApiTool {
-            name: self.name().to_string(),
-            description: "Runs a shell command and returns its output.\n- Always set the `workdir` param when using the shell_command function. Do not use `cd` unless absolutely necessary.".to_string(),
-            strict: false,
-            defer_loading: None,
-            parameters: JsonSchema::object(
-                properties,
-                Some(vec!["command".to_string()]),
-                Some(false.into()),
-            ),
-            output_schema: None,
-        })
-    }
-
-    /// 执行旧版 shell command。
-    async fn execute(&self, call: ToolCall, context: ToolContext) -> AppResult<ToolResult> {
-        let ToolInput::Function { arguments } = &call.input else {
-            return Err(AppError::Tool(
-                "shell_command requires function arguments".to_string(),
-            ));
-        };
-        let args: ShellCommandArgs = serde_json::from_str(arguments)?;
-        let workdir = resolve_workdir(&context.cwd, args.workdir.as_deref());
-        let output = run_command(
-            None,
-            &args.command,
-            workdir,
-            args.login.unwrap_or(true),
-            args.timeout_ms.unwrap_or(10_000),
-            10_000,
-            None,
-        )
-        .await?;
-        Ok(ToolResult {
-            output_kind: ToolOutputKind::Function,
-            call_id: call.call_id,
-            output: Value::String(
-                output
-                    .get("output")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-            ),
         })
     }
 }
@@ -587,32 +487,6 @@ fn resolve_workdir(cwd: &std::path::Path, workdir: Option<&str>) -> PathBuf {
         }
         None => cwd.to_path_buf(),
     }
-}
-
-/// 兼容 Codex approval 参数，但 full any 模式下忽略。
-fn approval_compat_properties() -> BTreeMap<String, JsonSchema> {
-    BTreeMap::from([
-        (
-            "sandbox_permissions".to_string(),
-            JsonSchema::string_enum(
-                vec![json!("use_default"), json!("require_escalated")],
-                Some("Per-command sandbox override. Defaults to `use_default`; use `require_escalated` for unsandboxed execution.".to_string()),
-            ),
-        ),
-        (
-            "justification".to_string(),
-            JsonSchema::string(Some(
-                "User-facing approval question for `require_escalated`; omit otherwise.".to_string(),
-            )),
-        ),
-        (
-            "prefix_rule".to_string(),
-            JsonSchema::array(
-                JsonSchema::string(None),
-                Some("Reusable approval prefix for `cmd`, only with `sandbox_permissions: \"require_escalated\"`.".to_string()),
-            ),
-        ),
-    ])
 }
 
 /// unified exec 输出 schema。

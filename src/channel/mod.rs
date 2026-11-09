@@ -2,10 +2,13 @@ use tokio::sync::mpsc;
 
 mod attachments;
 mod builtin;
+mod cache;
 mod capability;
 mod feishu;
 mod qq;
 mod telegram;
+mod user_input;
+mod web;
 
 #[cfg(test)]
 mod qq_test;
@@ -91,4 +94,18 @@ pub trait Channel: Send {
             "request_user_input is not implemented by this channel".to_string(),
         ))
     }
+}
+
+/// 解析 channel 凭据，适用于明文优先、环境变量兜底，例如 `None + TOKEN_ENV -> token`。
+fn resolve_channel_secret(value: Option<&str>, env_key: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            env_key
+                .and_then(|key| std::env::var(key).ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
 }

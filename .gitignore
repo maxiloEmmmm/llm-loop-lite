@@ -1,4 +1,5 @@
 /target/
+node_modules/
 
 # Local runtime state
 .llm-loop/
